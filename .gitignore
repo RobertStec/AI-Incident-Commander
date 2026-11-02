@@ -1,0 +1,37 @@
+
+# ==========================================
+# AI Incident Commander - Git Ignore
+# ==========================================
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Testing and code quality
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# IDE-specific local files
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
