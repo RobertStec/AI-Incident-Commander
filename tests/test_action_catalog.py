@@ -11,6 +11,7 @@ from ai_incident_commander.domain.action_catalog import (
     ActionCatalog,
     ActionDefinition,
     ActionEffect,
+    ActionEnvironmentNotAllowedError,
     ActionParameterDefinition,
     ActionParameterType,
     ActionParameterValidationError,
@@ -187,6 +188,7 @@ def _make_action_definition(
         description=f"Trusted definition for {action_name}.",
         effect=effect,
         risk_level=risk_level,
+        allowed_environments=("incident-lab",),
     )
 
 
@@ -806,6 +808,7 @@ def _make_parameter_schema_catalog(
         effect=ActionEffect.MUTATING,
         risk_level=RemediationRiskLevel.HIGH,
         parameters=parameters,
+        allowed_environments=("incident-lab",),
     )
     return ActionCatalog(definitions=(definition,)), definition
 
@@ -2195,3 +2198,362 @@ def test_action_allowed_values_rejection_preserves_arguments_and_hides_value() -
     assert "must match one of the allowed values" in str(error.value)
     assert original_value not in str(error.value)
     assert dict(step.parameters) == original_parameters
+
+
+def _make_environment_action_definition(
+    allowed_environments: tuple[str, ...],
+) -> ActionDefinition:
+    """Create a trusted action with an environment allowlist."""
+    return ActionDefinition(
+        action_name="restart_service",
+        description="Restart an affected service.",
+        effect=ActionEffect.MUTATING,
+        risk_level=RemediationRiskLevel.HIGH,
+        allowed_environments=allowed_environments,
+    )
+
+
+def test_action_definition_allowed_environments_default_to_empty() -> None:
+    definition = ActionDefinition(
+        action_name="inspect_service",
+        description="Inspect service health.",
+        effect=ActionEffect.READ_ONLY,
+        risk_level=RemediationRiskLevel.LOW,
+    )
+
+    assert definition.allowed_environments == ()
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        "incident-lab",
+        "staging",
+        "production",
+        "staging_eu_1",
+    ],
+)
+def test_action_definition_accepts_valid_environment_identifiers(
+    environment: str,
+) -> None:
+    definition = _make_environment_action_definition(
+        (environment,),
+    )
+
+    assert definition.allowed_environments == (environment,)
+
+
+def test_action_definition_accepts_multiple_environments() -> None:
+    environments = (
+        "incident-lab",
+        "staging",
+        "production",
+    )
+
+    definition = _make_environment_action_definition(
+        environments,
+    )
+
+    assert definition.allowed_environments == environments
+    assert len(definition.allowed_environments) == 3
+
+
+def test_action_definition_accepts_explicit_empty_environment_allowlist() -> None:
+    definition = _make_environment_action_definition(())
+
+    assert definition.allowed_environments == ()
+
+
+@pytest.mark.parametrize(
+    "invalid_collection",
+    [
+        ["incident-lab"],
+        "incident-lab",
+    ],
+)
+def test_action_definition_rejects_non_tuple_environments(
+    invalid_collection: object,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="allowed_environments must be a tuple",
+    ):
+        _make_environment_action_definition(
+            cast(tuple[str, ...], invalid_collection),
+        )
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        "",
+        " ",
+        "*",
+        "Production",
+        "incident lab",
+        "-staging",
+        "_staging",
+        "staging.eu",
+    ],
+)
+def test_action_definition_rejects_invalid_environment_identifiers(
+    environment: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="environment must use a lowercase environment identifier",
+    ):
+        _make_environment_action_definition(
+            (environment,),
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_environment",
+    [123, None],
+)
+def test_action_definition_rejects_non_string_environments(
+    invalid_environment: object,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="environment must use a lowercase environment identifier",
+    ):
+        _make_environment_action_definition(
+            (cast(str, invalid_environment),),
+        )
+
+
+@pytest.mark.parametrize(
+    "environments",
+    [
+        ("staging", "staging"),
+        ("incident-lab", "staging", "incident-lab"),
+    ],
+)
+def test_action_definition_rejects_duplicate_environments(
+    environments: tuple[str, ...],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="Duplicate allowed environment",
+    ):
+        _make_environment_action_definition(environments)
+
+
+def test_action_definition_allowed_environments_cannot_be_reassigned() -> None:
+    definition = _make_environment_action_definition(
+        ("incident-lab",),
+    )
+
+    field_name = "allowed_environments"
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(
+            definition,
+            field_name,
+            ("production",),
+        )
+
+    assert definition.allowed_environments == ("incident-lab",)
+
+
+def test_action_definition_environment_collection_is_immutable() -> None:
+    definition = _make_environment_action_definition(
+        ("incident-lab", "staging"),
+    )
+
+    mutable_view = cast(
+        MutableSequence[str],
+        definition.allowed_environments,
+    )
+
+    with pytest.raises(TypeError):
+        mutable_view[0] = "production"
+
+    assert definition.allowed_environments == (
+        "incident-lab",
+        "staging",
+    )
+
+
+def _make_environment_validation_step(
+    environment: str,
+    *,
+    risk_level: RemediationRiskLevel = RemediationRiskLevel.HIGH,
+    parameters: dict[str, RemediationParameterValue] | None = None,
+) -> RemediationStep:
+    """Create a proposed restart action in the selected environment."""
+    return RemediationStep(
+        plan_id=uuid4(),
+        position=1,
+        action_name="restart_service",
+        target="payments-api",
+        environment=environment,
+        risk_level=risk_level,
+        parameters={} if parameters is None else parameters,
+    )
+
+
+@pytest.mark.parametrize(
+    "environment",
+    ["incident-lab", "staging", "production"],
+)
+def test_action_environment_accepts_explicitly_allowed_environment(
+    environment: str,
+) -> None:
+    definition = _make_environment_action_definition(
+        ("incident-lab", "staging", "production"),
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step(environment)
+
+    assert validate_remediation_step(step, catalog) is definition
+    assert step.environment == environment
+
+
+@pytest.mark.parametrize(
+    "environment",
+    ["staging", "production"],
+)
+def test_action_environment_rejects_unlisted_environment(
+    environment: str,
+) -> None:
+    definition = _make_environment_action_definition(
+        ("incident-lab",),
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step(environment)
+
+    with pytest.raises(
+        ActionEnvironmentNotAllowedError,
+        match="is not allowed in the declared environment",
+    ):
+        validate_remediation_step(step, catalog)
+
+
+@pytest.mark.parametrize(
+    "environment",
+    ["incident-lab", "production"],
+)
+def test_action_environment_empty_allowlist_denies_every_environment(
+    environment: str,
+) -> None:
+    definition = _make_environment_action_definition(())
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step(environment)
+
+    with pytest.raises(ActionEnvironmentNotAllowedError):
+        validate_remediation_step(step, catalog)
+
+
+def test_action_environment_default_allowlist_denies_by_default() -> None:
+    definition = ActionDefinition(
+        action_name="restart_service",
+        description="Restart the affected service.",
+        effect=ActionEffect.MUTATING,
+        risk_level=RemediationRiskLevel.HIGH,
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step("incident-lab")
+
+    assert definition.allowed_environments == ()
+
+    with pytest.raises(ActionEnvironmentNotAllowedError):
+        validate_remediation_step(step, catalog)
+
+
+def test_action_environment_validation_runs_after_risk_validation() -> None:
+    definition = _make_environment_action_definition(
+        ("incident-lab",),
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step(
+        "production",
+        risk_level=RemediationRiskLevel.LOW,
+    )
+
+    with pytest.raises(ActionRiskMismatchError):
+        validate_remediation_step(step, catalog)
+
+
+def test_action_environment_validation_runs_before_parameter_validation() -> None:
+    definition = ActionDefinition(
+        action_name="restart_service",
+        description="Restart the affected service.",
+        effect=ActionEffect.MUTATING,
+        risk_level=RemediationRiskLevel.HIGH,
+        parameters=(
+            ActionParameterDefinition(
+                name="reason",
+                value_type=ActionParameterType.STRING,
+            ),
+        ),
+        allowed_environments=("incident-lab",),
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step(
+        "production",
+        parameters={"unknown": "some-value"},
+    )
+
+    with pytest.raises(ActionEnvironmentNotAllowedError):
+        validate_remediation_step(step, catalog)
+
+
+def test_action_environment_validation_does_not_modify_valid_step() -> None:
+    definition = _make_environment_action_definition(
+        ("incident-lab",),
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step("incident-lab")
+
+    original_step_id = step.step_id
+    original_parameters = dict(step.parameters)
+
+    assert validate_remediation_step(step, catalog) is definition
+    assert step.step_id == original_step_id
+    assert step.environment == "incident-lab"
+    assert dict(step.parameters) == original_parameters
+
+
+def test_action_environment_rejection_does_not_modify_step() -> None:
+    definition = _make_environment_action_definition(
+        ("incident-lab",),
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = _make_environment_validation_step("production")
+
+    original_step_id = step.step_id
+    original_parameters = dict(step.parameters)
+
+    with pytest.raises(ActionEnvironmentNotAllowedError) as error:
+        validate_remediation_step(step, catalog)
+
+    assert "production" not in str(error.value)
+    assert "payments-api" not in str(error.value)
+    assert step.environment == "production"
+    assert step.step_id == original_step_id
+    assert dict(step.parameters) == original_parameters
+
+
+def test_action_environment_policy_also_applies_to_read_only_actions() -> None:
+    definition = ActionDefinition(
+        action_name="inspect_service",
+        description="Inspect service status.",
+        effect=ActionEffect.READ_ONLY,
+        risk_level=RemediationRiskLevel.LOW,
+        allowed_environments=("incident-lab",),
+    )
+    catalog = ActionCatalog(definitions=(definition,))
+    step = RemediationStep(
+        plan_id=uuid4(),
+        position=1,
+        action_name="inspect_service",
+        target="payments-api",
+        environment="production",
+        risk_level=RemediationRiskLevel.LOW,
+    )
+
+    with pytest.raises(ActionEnvironmentNotAllowedError):
+        validate_remediation_step(step, catalog)

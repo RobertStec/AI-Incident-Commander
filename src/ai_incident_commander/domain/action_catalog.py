@@ -141,6 +141,7 @@ class ActionDefinition:
     effect: ActionEffect
     risk_level: RemediationRiskLevel
     parameters: tuple[ActionParameterDefinition, ...] = ()
+    allowed_environments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the action definition invariants."""
@@ -175,6 +176,22 @@ class ActionDefinition:
 
             parameter_names.add(parameter.name)
 
+        if not isinstance(self.allowed_environments, tuple):
+            raise ValueError("Action definition allowed_environments must be a tuple.")
+
+        seen_environments: set[str] = set()
+
+        for environment in self.allowed_environments:
+            if type(environment) is not str or fullmatch(r"[a-z][a-z0-9_-]*", environment) is None:
+                raise ValueError(
+                    "Action definition environment must use a lowercase environment identifier."
+                )
+
+            if environment in seen_environments:
+                raise ValueError(f"Duplicate allowed environment: {environment}.")
+
+            seen_environments.add(environment)
+
 
 class UnknownActionError(LookupError):
     """Raised when an action is absent from the trusted catalog."""
@@ -182,6 +199,10 @@ class UnknownActionError(LookupError):
 
 class ActionRiskMismatchError(ValueError):
     """Raised when a step risk differs from its trusted action definition."""
+
+
+class ActionEnvironmentNotAllowedError(ValueError):
+    """Raised when an action is not allowed in the declared environment."""
 
 
 class ActionParameterValidationError(ValueError):
@@ -341,6 +362,11 @@ def validate_remediation_step(
         raise ActionRiskMismatchError(
             f"Remediation step {step.action_name!r} risk_level "
             "does not match the trusted action definition."
+        )
+
+    if step.environment not in definition.allowed_environments:
+        raise ActionEnvironmentNotAllowedError(
+            f"Remediation action {step.action_name!r} is not allowed in the declared environment."
         )
 
     _validate_action_parameter_names(step, definition)
