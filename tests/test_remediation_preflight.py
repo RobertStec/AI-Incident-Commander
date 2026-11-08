@@ -27,6 +27,8 @@ from ai_incident_commander.domain.action_catalog import (
     ActionDefinition,
     ActionEffect,
     ActionEnvironmentNotAllowedError,
+    ActionParameterDefinition,
+    ActionParameterType,
     ActionParameterValidationError,
     ActionRiskMismatchError,
     UnknownActionError,
@@ -338,3 +340,108 @@ def test_preflight_does_not_modify_remediation_step() -> None:
     assert step.target == "payments-api"
     assert step.environment == "incident-lab"
     assert dict(step.parameters) == original_parameters
+
+
+def _make_catalog_with_reason_parameter() -> ActionCatalog:
+    """Create an action accepting a validated reason parameter."""
+    definition = ActionDefinition(
+        action_name="restart_service",
+        description="Restart an affected service.",
+        effect=ActionEffect.MUTATING,
+        risk_level=RemediationRiskLevel.HIGH,
+        parameters=(
+            ActionParameterDefinition(
+                name="reason",
+                value_type=ActionParameterType.STRING,
+            ),
+        ),
+        allowed_environments=("incident-lab",),
+    )
+    return ActionCatalog(definitions=(definition,))
+
+
+def test_preflight_snapshot_references_verified_step() -> None:
+    step = _make_step()
+    catalog = ActionCatalog(
+        definitions=(_make_action_definition(),),
+    )
+    resolver: TargetResolver = RecordingTargetResolver(
+        _make_resolved_target(),
+    )
+
+    result = asyncio.run(validate_remediation_preflight(step, catalog, resolver))
+
+    assert result.step_snapshot is step
+    assert result.step_snapshot.step_id == step.step_id
+    assert result.step_snapshot.plan_id == step.plan_id
+
+
+def test_preflight_snapshot_preserves_validated_parameters() -> None:
+    original_parameters: dict[str, RemediationParameterValue] = {
+        "reason": "  approved maintenance  ",
+    }
+    step = _make_step(parameters=original_parameters)
+    catalog = _make_catalog_with_reason_parameter()
+    resolver: TargetResolver = RecordingTargetResolver(
+        _make_resolved_target(),
+    )
+
+    result = asyncio.run(validate_remediation_preflight(step, catalog, resolver))
+
+    snapshot = result.step_snapshot
+
+    assert snapshot is step
+    assert snapshot is not None
+    assert dict(snapshot.parameters) == original_parameters
+    assert dict(step.parameters) == original_parameters
+
+
+def test_synthetic_preflight_result_defaults_to_no_snapshot() -> None:
+    result = RemediationPreflightResult(
+        action=_make_action_definition(),
+        target=_make_resolved_target(),
+    )
+
+    assert result.step_snapshot is None
+
+
+def test_preflight_result_repr_excludes_snapshot_parameters() -> None:
+    sensitive_value = "internal-maintenance-reference-123"
+    step = _make_step(
+        parameters={"reason": sensitive_value},
+    )
+    catalog = _make_catalog_with_reason_parameter()
+    resolver: TargetResolver = RecordingTargetResolver(
+        _make_resolved_target(),
+    )
+
+    result = asyncio.run(validate_remediation_preflight(step, catalog, resolver))
+
+    representation = repr(result)
+
+    assert result.step_snapshot is step
+    assert "step_snapshot" not in representation
+    assert sensitive_value not in representation
+
+
+def test_preflight_snapshot_field_cannot_be_reassigned() -> None:
+    step = _make_step()
+    catalog = ActionCatalog(
+        definitions=(_make_action_definition(),),
+    )
+    resolver: TargetResolver = RecordingTargetResolver(
+        _make_resolved_target(),
+    )
+
+    result = asyncio.run(validate_remediation_preflight(step, catalog, resolver))
+
+    field_name = "step_snapshot"
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(
+            result,
+            field_name,
+            _make_step(),
+        )
+
+    assert result.step_snapshot is step

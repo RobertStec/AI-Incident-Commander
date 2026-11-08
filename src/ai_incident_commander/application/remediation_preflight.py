@@ -1,6 +1,6 @@
 """Application preflight checks for proposed remediation actions."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ai_incident_commander.application.target_resolver import TargetResolver
 from ai_incident_commander.application.target_verification import (
@@ -21,6 +21,11 @@ class RemediationPreflightResult:
 
     action: ActionDefinition
     target: ResolvedTarget
+    step_snapshot: RemediationStep | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 async def validate_remediation_preflight(
@@ -39,4 +44,5 @@ async def validate_remediation_preflight(
     return RemediationPreflightResult(
         action=definition,
         target=resolved_target,
+        step_snapshot=step,
     )
