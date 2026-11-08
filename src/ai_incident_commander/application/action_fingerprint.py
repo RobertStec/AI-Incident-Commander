@@ -2,13 +2,14 @@
 
 from hashlib import sha256
 from json import dumps
+from re import fullmatch
 
 from ai_incident_commander.application.remediation_preflight import (
     RemediationPreflightResult,
 )
 from ai_incident_commander.domain.remediation import RemediationStep
 
-_FINGERPRINT_DOMAIN = b"ai-incident-commander:remediation-action:v1\x00"
+_FINGERPRINT_DOMAIN = b"ai-incident-commander:remediation-action:v2\x00"
 
 
 class ActionFingerprintInputMismatchError(ValueError):
@@ -65,8 +66,19 @@ def create_action_fingerprint(
             "Remediation step and preflight result are inconsistent."
         )
 
+    policy_version = preflight.policy_version
+
+    if (
+        not isinstance(policy_version, str)
+        or fullmatch(r"apv:v1:[0-9a-f]{64}", policy_version) is None
+    ):
+        raise ActionFingerprintInputMismatchError(
+            "Remediation preflight result has no valid trusted policy version."
+        )
+
     payload = {
-        "version": 1,
+        "version": 2,
+        "policy_version": policy_version,
         "plan_id": str(step.plan_id),
         "step_id": str(step.step_id),
         "position": step.position,
@@ -88,4 +100,4 @@ def create_action_fingerprint(
 
     digest = sha256(_FINGERPRINT_DOMAIN + canonical_bytes).hexdigest()
 
-    return f"afp:v1:{digest}"
+    return f"afp:v2:{digest}"

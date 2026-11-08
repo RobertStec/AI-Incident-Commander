@@ -11,10 +11,14 @@ from ai_incident_commander.application.action_fingerprint import (
     ActionFingerprintInputMismatchError,
     create_action_fingerprint,
 )
+from ai_incident_commander.application.action_policy_version import (
+    create_action_policy_version,
+)
 from ai_incident_commander.application.remediation_preflight import (
     RemediationPreflightResult,
 )
 from ai_incident_commander.domain.action_catalog import (
+    ActionCatalog,
     ActionDefinition,
     ActionEffect,
     ActionParameterDefinition,
@@ -81,6 +85,7 @@ def _make_preflight(*, step: RemediationStep) -> RemediationPreflightResult:
         action=definition,
         target=resolved,
         step_snapshot=step,
+        policy_version=create_action_policy_version(ActionCatalog(definitions=(definition,))),
     )
 
 
@@ -91,7 +96,7 @@ def test_fingerprint_has_versioned_sha256_format() -> None:
         _make_preflight(step=step),
     )
 
-    assert fullmatch(r"afp:v1:[0-9a-f]{64}", fingerprint) is not None
+    assert fullmatch(r"afp:v2:[0-9a-f]{64}", fingerprint) is not None
 
 
 def test_fingerprint_is_deterministic() -> None:
@@ -474,3 +479,64 @@ def test_fingerprint_rejects_step_scope_changed_after_preflight(
         match="differs from the validated preflight snapshot",
     ):
         create_action_fingerprint(changed_step, preflight)
+
+
+def test_fingerprint_uses_version_of_trusted_action_catalog() -> None:
+    step = _make_step()
+    preflight = _make_preflight(step=step)
+    catalog = ActionCatalog(definitions=(preflight.action,))
+
+    assert preflight.policy_version == create_action_policy_version(catalog)
+
+
+def test_fingerprint_changes_when_unrelated_catalog_action_changes() -> None:
+    step = _make_step()
+    preflight = _make_preflight(step=step)
+    additional_action = ActionDefinition(
+        action_name="inspect_service",
+        description="Inspect service status.",
+        effect=ActionEffect.READ_ONLY,
+        risk_level=RemediationRiskLevel.LOW,
+        allowed_environments=("incident-lab",),
+    )
+    changed_catalog = ActionCatalog(
+        definitions=(preflight.action, additional_action),
+    )
+    changed_preflight = replace(
+        preflight,
+        policy_version=create_action_policy_version(changed_catalog),
+    )
+
+    assert changed_preflight.policy_version != preflight.policy_version
+    assert create_action_fingerprint(step, changed_preflight) != create_action_fingerprint(
+        step, preflight
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_policy_version",
+    [
+        None,
+        "",
+        "apv:v1:",
+        "apv:v1:" + "0" * 63,
+        "apv:v1:" + "z" * 64,
+        "apv:v1:" + "A" * 64,
+        "apv:v2:" + "0" * 64,
+        "afp:v2:" + "0" * 64,
+    ],
+)
+def test_fingerprint_rejects_invalid_policy_version(
+    invalid_policy_version: str | None,
+) -> None:
+    step = _make_step()
+    preflight = replace(
+        _make_preflight(step=step),
+        policy_version=invalid_policy_version,
+    )
+
+    with pytest.raises(
+        ActionFingerprintInputMismatchError,
+        match="no valid trusted policy version",
+    ):
+        create_action_fingerprint(step, preflight)
