@@ -2,7 +2,10 @@
 
 import asyncio
 import inspect
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
+from inspect import Parameter, signature
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -11,6 +14,7 @@ from ai_incident_commander.application.approval_authorization import (
     ApprovalAuthorizationError,
     ApprovalAuthorizer,
     ApprovalPermissionDeniedError,
+    AuthenticatedOperatorContext,
 )
 from ai_incident_commander.domain.remediation_approval import (
     RemediationApprovalOutcome,
@@ -25,7 +29,7 @@ class RecordingApprovalAuthorizer:
         self.allowed = allowed
         self.calls: list[
             tuple[
-                str,
+                AuthenticatedOperatorContext,
                 RemediationApprovalRequest,
                 RemediationApprovalOutcome,
             ]
@@ -34,11 +38,11 @@ class RecordingApprovalAuthorizer:
     async def ensure_can_decide(
         self,
         *,
-        operator_id: str,
+        operator: AuthenticatedOperatorContext,
         request: RemediationApprovalRequest,
         outcome: RemediationApprovalOutcome,
     ) -> None:
-        self.calls.append((operator_id, request, outcome))
+        self.calls.append((operator, request, outcome))
 
         if not self.allowed:
             raise ApprovalPermissionDeniedError(
@@ -55,7 +59,7 @@ class FailingApprovalAuthorizer:
     async def ensure_can_decide(
         self,
         *,
-        operator_id: str,
+        operator: AuthenticatedOperatorContext,
         request: RemediationApprovalRequest,
         outcome: RemediationApprovalOutcome,
     ) -> None:
@@ -100,10 +104,11 @@ def test_allowed_authorizer_accepts_both_outcomes(
     request = _make_request()
     recorder = RecordingApprovalAuthorizer(allowed=True)
     authorizer: ApprovalAuthorizer = recorder
+    operator = AuthenticatedOperatorContext(operator_id="operator-123")
 
     asyncio.run(
         authorizer.ensure_can_decide(
-            operator_id="operator-123",
+            operator=operator,
             request=request,
             outcome=outcome,
         )
@@ -113,7 +118,8 @@ def test_allowed_authorizer_accepts_both_outcomes(
 
     recorded_operator, recorded_request, recorded_outcome = recorder.calls[0]
 
-    assert recorded_operator == "operator-123"
+    assert recorded_operator is operator
+    assert recorded_operator.operator_id == "operator-123"
     assert recorded_request is request
     assert recorded_outcome is outcome
 
@@ -131,17 +137,18 @@ def test_denied_authorization_raises_permission_error(
     request = _make_request()
     recorder = RecordingApprovalAuthorizer(allowed=False)
     authorizer: ApprovalAuthorizer = recorder
+    operator = AuthenticatedOperatorContext(operator_id="operator-without-permission")
 
     with pytest.raises(ApprovalPermissionDeniedError):
         asyncio.run(
             authorizer.ensure_can_decide(
-                operator_id="operator-without-permission",
+                operator=operator,
                 request=request,
                 outcome=outcome,
             )
         )
 
-    assert recorder.calls == [("operator-without-permission", request, outcome)]
+    assert recorder.calls == [(operator, request, outcome)]
 
 
 def test_permission_denied_error_inherits_authorization_error() -> None:
@@ -155,14 +162,92 @@ def test_authorization_backend_failure_is_propagated() -> None:
     request = _make_request()
     expected_error = RuntimeError("Authorization backend unavailable.")
     authorizer: ApprovalAuthorizer = FailingApprovalAuthorizer(expected_error)
+    operator = AuthenticatedOperatorContext(operator_id="operator-123")
 
     with pytest.raises(RuntimeError) as captured:
         asyncio.run(
             authorizer.ensure_can_decide(
-                operator_id="operator-123",
+                operator=operator,
                 request=request,
                 outcome=RemediationApprovalOutcome.APPROVED,
             )
         )
 
     assert captured.value is expected_error
+
+
+@pytest.mark.parametrize(
+    "operator_id",
+    [
+        "operator-123",
+        "tenant-7:user-9",
+        "żółw-42",
+    ],
+)
+def test_authenticated_operator_context_accepts_canonical_id(
+    operator_id: str,
+) -> None:
+    context = AuthenticatedOperatorContext(operator_id=operator_id)
+
+    assert context.operator_id == operator_id
+
+
+@pytest.mark.parametrize(
+    "operator_id",
+    ["", " ", "\t", "\n", "\u00a0"],
+)
+def test_authenticated_operator_context_rejects_empty_or_whitespace_id(
+    operator_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="Authenticated operator_id"):
+        AuthenticatedOperatorContext(operator_id=operator_id)
+
+
+@pytest.mark.parametrize(
+    "operator_id",
+    [" operator-123", "operator-123 ", "\toperator-123", "operator-123\n"],
+)
+def test_authenticated_operator_context_rejects_uncanonical_whitespace(
+    operator_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="Authenticated operator_id"):
+        AuthenticatedOperatorContext(operator_id=operator_id)
+
+
+class OperatorIdSubclass(str):
+    """A string subclass must not bypass exact-type validation."""
+
+
+@pytest.mark.parametrize(
+    "invalid_id",
+    [None, 123, True, b"operator-123", OperatorIdSubclass("operator-123")],
+    ids=["none", "integer", "boolean", "bytes", "string-subclass"],
+)
+def test_authenticated_operator_context_rejects_non_plain_strings(
+    invalid_id: object,
+) -> None:
+    # Deliberately bypass the static type to test runtime validation.
+    with pytest.raises(ValueError, match="Authenticated operator_id"):
+        AuthenticatedOperatorContext(operator_id=cast(str, invalid_id))
+
+
+def test_authenticated_operator_context_is_immutable() -> None:
+    context = AuthenticatedOperatorContext(operator_id="operator-123")
+    field_name = "operator_id"
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(context, field_name, "another-operator")
+
+    assert context.operator_id == "operator-123"
+
+
+def test_authenticated_operator_context_uses_slots() -> None:
+    context = AuthenticatedOperatorContext(operator_id="operator-123")
+
+    assert not hasattr(context, "__dict__")
+
+
+def test_authenticated_operator_context_requires_keyword_argument() -> None:
+    operator_id_parameter = signature(AuthenticatedOperatorContext).parameters["operator_id"]
+
+    assert operator_id_parameter.kind is Parameter.KEYWORD_ONLY
