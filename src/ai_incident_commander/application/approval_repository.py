@@ -21,6 +21,10 @@ class ApprovalRequestNotFoundError(ApprovalRepositoryError):
     """Raised when a decision references a missing approval request."""
 
 
+class ApprovalRequestNotActiveError(ApprovalRepositoryError):
+    """Raised when a request is outside its validity window at persistence."""
+
+
 class ApprovalAlreadyDecidedError(ApprovalRepositoryError):
     """Raised when an approval request already has a decision."""
 
@@ -46,5 +50,18 @@ class ApprovalRepository(Protocol):
         self,
         decision: RemediationApprovalDecision,
     ) -> None:
-        """Atomically record one decision for an existing request."""
+        """Atomically persist a decision for an active request.
+
+        The persistence adapter must enforce in one atomic operation:
+        - the referenced approval request exists;
+        - the request is active at the storage-side recording time;
+        - no decision has previously been recorded for the request.
+
+        Raise ApprovalRequestNotFoundError for a missing request.
+        Raise ApprovalRequestNotActiveError for an inactive request.
+        Raise ApprovalAlreadyDecidedError for a previously decided request.
+
+        The decision's decided_at timestamp must not replace the
+        storage-side validity check.
+        """
         ...
