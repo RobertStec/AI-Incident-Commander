@@ -6,10 +6,7 @@
 
 ## 1. Bieżący stan
 
-- **Zakończony etap:** `1.7.8.11.29` — testy integracyjne `PostgresApprovalRepository.record_decision_once()`.
-- **Aktualny etap:** przegląd zmian Git, commit i push.
-- **Status weryfikacji:** PostgreSQL integration tests — 17 passed. Pełna regresja — 930 passed, 0 failed, 0 skipped.
-- **Następny krok:** zapisanie zweryfikowanej implementacji PostgreSQL Approval Persistence w repozytorium Git.
+- **Zakończony etap:** Status: 1.7.8.11.31 — zakończony technicznie, oczekuje na wersjonowanie w Git.
 
 ## 2. Ustalone decyzje architektoniczne
 
@@ -130,3 +127,22 @@ Testy integracyjne powinny objąć co najmniej:
   - Mypy — 31 plików, brak błędów.
 - **Ograniczenie:** nie przeprowadzono jeszcze testu integracyjnego `ApprovalApplicationService` utworzonego przez Composition Root na rzeczywistym PostgreSQL.
 - **Następny krok:** commit i push, następnie integracyjny test pełnego cyklu zatwierdzania.
+
+### 2026-11-11 — Etap 1.7.8.11.31: Integration Test Composition Root
+
+- **Status:** implementacja testów i weryfikacja zakończone.
+- **Nowy plik:** `tests/integration/test_bootstrap_integration.py`.
+- **Zakres:** pełna integracja `approval_service_lifespan()` → `ApprovalApplicationService.decide()` → `PostgresApprovalRepository` → PostgreSQL.
+- **Potwierdzone scenariusze:**
+  - Uprawniony operator może zapisać decyzję.
+  - Nieuprawniony operator otrzymuje `ApprovalPermissionDeniedError`, bez zapisu decyzji.
+  - Ponowne utworzenie Composition Root nie pozwala nadpisać istniejącej decyzji (`ApprovalAlreadyDecidedError`).
+- **Weryfikacja:**
+  - Testy jednostkowe: 918 passed.
+  - Testy integracyjne PostgreSQL: 20 passed.
+  - Pełna regresja: **938 passed, 0 failed, 0 skipped**.
+  - Ruff linting i formatowanie: PASSED.
+  - Mypy: 31 plików, brak błędów.
+- **Ograniczenie:** rzeczywisty mechanizm uwierzytelniania i produkcyjny adapter autoryzacji/RBAC nie są jeszcze zaimplementowane.
+- **Pozostało:** commit i push.
+- **Następny krok:** wybór kolejnego etapu rozwoju Human-in-the-Loop.
