@@ -99,3 +99,34 @@ Testy integracyjne powinny objąć co najmniej:
 - **Decyzja architektoniczna:** utrzymujemy transakcyjny zapis decyzji z `SELECT FOR UPDATE`, kontrolą czasu PostgreSQL po uzyskaniu blokady oraz `UNIQUE(request_id)`.
 - **Pozostało:** przegląd zmian Git, commit i push.
 - **Następny krok:** zakończenie wersjonowania implementacji PostgreSQL approval persistence.
+
+### 2026-11-11 — Zakończenie PostgreSQL Approval Persistence
+
+- **Status:** implementacja, testy integracyjne i wersjonowanie zakończone.
+- **Pełna regresja:** 930 passed, 0 failed, 0 skipped.
+- **Commit:** `097db9c`.
+- **Git Push:** zakończony pomyślnie (`origin/main`).
+- **Working tree:** clean.
+- **Zakończone etapy:** `1.7.8.11.28`, `1.7.8.11.28a`, `1.7.8.11.29`.
+- **Następny obszar:** integracja trwałego repozytorium zatwierdzeń z warstwą aplikacyjną i pozostałymi komponentami Human-in-the-Loop.
+
+### 2026-11-11 — Etap 1.7.8.11.30: Composition Root
+
+- **Status:** implementacja zakończona, testy i kontrola jakości zaliczone.
+- **Nowe pliki:**
+  - `src/ai_incident_commander/bootstrap.py`
+  - `tests/unit/test_bootstrap.py`
+- **Decyzje architektoniczne:**
+  - Composition Root niezależny od FastAPI i LangGraph.
+  - Jawne Dependency Injection przez istniejące porty aplikacyjne.
+  - `ApprovalAuthorizer` jest wymagany — brak domyślnej autoryzacji `allow-all`.
+  - `AsyncEngine` jest zarządzany przez asynchroniczny context manager i zamykany przez `dispose()`.
+  - Zachowano rozdzielenie warstw application i infrastructure.
+- **Weryfikacja:**
+  - 5 nowych testów jednostkowych — PASSED.
+  - Pełna regresja: 935 passed, 0 failed, 0 skipped.
+  - Ruff linting — PASSED.
+  - Ruff formatting — 56 plików poprawnie sformatowanych.
+  - Mypy — 31 plików, brak błędów.
+- **Ograniczenie:** nie przeprowadzono jeszcze testu integracyjnego `ApprovalApplicationService` utworzonego przez Composition Root na rzeczywistym PostgreSQL.
+- **Następny krok:** commit i push, następnie integracyjny test pełnego cyklu zatwierdzania.

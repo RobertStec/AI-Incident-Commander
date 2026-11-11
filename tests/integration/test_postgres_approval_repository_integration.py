@@ -687,12 +687,16 @@ def test_record_decision_once_allows_only_one_concurrent_operator() -> None:
             # Observe committed state through an independent database connection.
             async with engine.connect() as connection:
                 persisted = (
-                    await connection.execute(
-                        sa.select(approval_decisions_table).where(
-                            approval_decisions_table.c.request_id == request.request_id
+                    (
+                        await connection.execute(
+                            sa.select(approval_decisions_table).where(
+                                approval_decisions_table.c.request_id == request.request_id
+                            )
                         )
                     )
-                ).mappings().all()
+                    .mappings()
+                    .all()
+                )
 
             assert len(persisted) == 1
             row = persisted[0]
@@ -714,6 +718,7 @@ def test_record_decision_once_allows_only_one_concurrent_operator() -> None:
                 await engine.dispose()
 
     asyncio.run(run_scenario())
+
 
 def test_record_decision_once_rejects_decisions_expired_while_waiting_for_lock() -> None:
     """Recheck DB time after row-lock contention; reject both expired attempts."""
@@ -929,12 +934,17 @@ def test_record_decision_once_rolls_back_unexpected_primary_key_violation() -> N
 
             async with engine.connect() as connection:
                 stored_retry = (
-                    await connection.execute(
-                        sa.select(approval_decisions_table).where(
-                            approval_decisions_table.c.request_id == competing_request.request_id
+                    (
+                        await connection.execute(
+                            sa.select(approval_decisions_table).where(
+                                approval_decisions_table.c.request_id
+                                == competing_request.request_id
+                            )
                         )
                     )
-                ).mappings().one()
+                    .mappings()
+                    .one()
+                )
             assert stored_retry["decision_id"] == retry.decision_id
             assert stored_retry["outcome"] == retry.outcome.value
             assert competing_request.requested_at <= stored_retry["recorded_at"]

@@ -101,9 +101,9 @@ class PostgresApprovalRepository:
 
         # Evaluate the database clock once inside the INSERT statement,
         # after locking the request, and reuse it for both validation and audit.
-        recording_clock = sa.select(
-            sa.func.clock_timestamp().label("recorded_at")
-        ).cte("recording_clock")
+        recording_clock = sa.select(sa.func.clock_timestamp().label("recorded_at")).cte(
+            "recording_clock"
+        )
 
         insert_source = (
             sa.select(
@@ -164,6 +164,8 @@ class PostgresApprovalRepository:
                 getattr(original_error, "sqlstate", None) == "23505"
                 and constraint_name == "uq_approval_decisions_request_id"
             ):
-                raise ApprovalAlreadyDecidedError("Approval request already has a decision.") from exc
+                raise ApprovalAlreadyDecidedError(
+                    "Approval request already has a decision."
+                ) from exc
 
             raise
