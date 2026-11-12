@@ -1,7 +1,7 @@
 """Unit tests for approval eligibility before any remediation execution claim."""
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -11,6 +11,7 @@ from ai_incident_commander.application.approval_execution_guard import (
     ApprovalExecutionDeniedError,
     ApprovalExecutionGuard,
     ApprovalExecutionScopeMismatchError,
+    VerifiedExecutionScope,
 )
 from ai_incident_commander.application.approval_request_service import (
     ApprovalRequestCreationService,
@@ -232,3 +233,74 @@ def test_inconsistent_persisted_decision_denied() -> None:
         _validate(harness)
 
     assert harness.resolver.calls == []
+
+
+def test_verified_scope_returns_exactly_approved_data_from_current_preflight() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.APPROVED)
+
+    verified = asyncio.run(
+        harness.guard.verify_scope_for_step(
+            request_id=harness.request.request_id,
+            step=harness.step,
+        )
+    )
+
+    assert isinstance(verified, VerifiedExecutionScope)
+    assert verified.request_id == harness.request.request_id
+    assert verified.plan_id == harness.step.plan_id
+    assert verified.step_id == harness.step.step_id
+    assert verified.action_fingerprint == harness.request.action_fingerprint
+    assert verified.policy_version == harness.request.policy_version
+    assert harness.repository.reads == ["request", "decision"]
+    assert harness.resolver.calls == [("payments-api", "incident-lab")]
+
+
+def test_verified_scope_rejected_decision_never_resolves_target() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.REJECTED)
+
+    with pytest.raises(ApprovalExecutionDeniedError, match="not been approved"):
+        asyncio.run(
+            harness.guard.verify_scope_for_step(
+                request_id=harness.request.request_id, step=harness.step
+            )
+        )
+
+    assert harness.resolver.calls == []
+
+
+def test_verified_scope_refuses_changed_target_without_returning_scope() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.APPROVED)
+    harness.resolver.target = replace(harness.resolver.target, resource_id="changed-resource")
+
+    with pytest.raises(ApprovalExecutionScopeMismatchError, match="fingerprint"):
+        asyncio.run(
+            harness.guard.verify_scope_for_step(
+                request_id=harness.request.request_id, step=harness.step
+            )
+        )
+
+    assert harness.resolver.calls == [("payments-api", "incident-lab")]
+
+
+def test_verified_scope_is_immutable_and_old_validation_contract_is_preserved() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.APPROVED)
+    assert (
+        asyncio.run(
+            harness.guard.validate_for_step(
+                request_id=harness.request.request_id, step=harness.step
+            )
+        )
+        is None
+    )
+
+    verified = asyncio.run(
+        harness.guard.verify_scope_for_step(
+            request_id=harness.request.request_id, step=harness.step
+        )
+    )
+    with pytest.raises(FrozenInstanceError):
+        verified.action_fingerprint = "afp:v2:" + "f" * 64  # type: ignore[misc]

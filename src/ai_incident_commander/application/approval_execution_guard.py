@@ -3,6 +3,7 @@
 A successful check is not an execution claim or permission to invoke MCP.
 """
 
+from dataclasses import dataclass
 from uuid import UUID
 
 from ai_incident_commander.application.action_fingerprint import create_action_fingerprint
@@ -29,6 +30,20 @@ class ApprovalExecutionScopeMismatchError(ApprovalExecutionDeniedError):
     """The proposed action differs from the scope recorded for approval."""
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class VerifiedExecutionScope:
+    """Scope verified against trusted preflight and persisted approval.
+
+    This is not an execution token; only claim_once() may reserve execution.
+    """
+
+    request_id: UUID
+    plan_id: UUID
+    step_id: UUID
+    action_fingerprint: str
+    policy_version: str
+
+
 class ApprovalExecutionGuard:
     """Validate approval eligibility; do not reserve or perform execution."""
 
@@ -44,7 +59,13 @@ class ApprovalExecutionGuard:
         self._resolver = resolver
 
     async def validate_for_step(self, *, request_id: UUID, step: RemediationStep) -> None:
-        """Fail closed unless a persisted approval matches the current preflight."""
+        """Retain the existing validation-only API (returns None on success)."""
+        await self.verify_scope_for_step(request_id=request_id, step=step)
+
+    async def verify_scope_for_step(
+        self, *, request_id: UUID, step: RemediationStep
+    ) -> VerifiedExecutionScope:
+        """Return the freshly verified scope; never accept a caller-provided snapshot."""
         request = await self._repository.get_request(request_id)
         if request is None:
             raise ApprovalExecutionDeniedError("Approval request does not exist.")
@@ -72,5 +93,14 @@ class ApprovalExecutionGuard:
         preflight = await validate_remediation_preflight(step, self._catalog, self._resolver)
         if preflight.policy_version != request.policy_version:
             raise ApprovalExecutionScopeMismatchError("Action policy version has changed.")
-        if create_action_fingerprint(step, preflight) != request.action_fingerprint:
+        fingerprint = create_action_fingerprint(step, preflight)
+        if fingerprint != request.action_fingerprint:
             raise ApprovalExecutionScopeMismatchError("Remediation action fingerprint has changed.")
+
+        return VerifiedExecutionScope(
+            request_id=request.request_id,
+            plan_id=step.plan_id,
+            step_id=step.step_id,
+            action_fingerprint=fingerprint,
+            policy_version=request.policy_version,
+        )
