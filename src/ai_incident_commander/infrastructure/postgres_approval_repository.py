@@ -15,6 +15,7 @@ from ai_incident_commander.application.approval_repository import (
 )
 from ai_incident_commander.domain.remediation_approval import (
     RemediationApprovalDecision,
+    RemediationApprovalOutcome,
     RemediationApprovalRequest,
 )
 from ai_incident_commander.infrastructure.approval_tables import (
@@ -83,6 +84,31 @@ class PostgresApprovalRepository:
             policy_version=row["policy_version"],
             requested_at=row["requested_at"].astimezone(UTC),
             expires_at=row["expires_at"].astimezone(UTC),
+        )
+
+    async def get_decision(
+        self,
+        request_id: UUID,
+    ) -> RemediationApprovalDecision | None:
+        """Read a persisted decision without modifying approval records."""
+        statement = sa.select(approval_decisions_table).where(
+            approval_decisions_table.c.request_id == request_id
+        )
+
+        async with self._engine.connect() as connection:
+            result = await connection.execute(statement)
+            row = result.mappings().one_or_none()
+
+        if row is None:
+            return None
+
+        return RemediationApprovalDecision(
+            decision_id=row["decision_id"],
+            request_id=row["request_id"],
+            operator_id=row["operator_id"],
+            outcome=RemediationApprovalOutcome(row["outcome"]),
+            decided_at=row["decided_at"].astimezone(UTC),
+            reason=row["reason"],
         )
 
     async def record_decision_once(

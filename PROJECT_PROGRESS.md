@@ -6,8 +6,8 @@
 
 ## 1. Bieżący stan
 
-- **Status:** 958 testów zaliczonych. Etapy 1.7.8.11.32–1.7.8.11.34 zakończone technicznie, pozostało wersjonowanie.
-- **Następny etap:** zakończony etap na 1.7.8.11.34, ze statusem „zweryfikowany, oczekuje na wersjonowanie”.
+- **Status:** 968 testów zaliczonych. Etap 1.7.8.11.35 — zakończony technicznie, pozostało wersjonowanie.
+- **Następny etap:** zakończony etap na 1.7.8.11.35 jako zweryfikowany, oczekujący na wersjonowanie.
 
 ## 2. Ustalone decyzje architektoniczne
 
@@ -183,3 +183,27 @@ Testy integracyjne powinny objąć co najmniej:
 - **Kontrola jakości:** Ruff lint PASSED, Ruff format PASSED, Mypy PASSED (32 pliki).
 - **Ograniczenia:** produkcyjne uwierzytelnianie/RBAC oraz wykonanie remediation przez MCP pozostają do implementacji.
 - **Następny krok:** przegląd zmian Git, commit i push.
+
+### 2026-11-12 — Zakończenie etapów 1.7.8.11.32–1.7.8.11.34
+
+- **Status:** implementacja, testy, commit i push zakończone.
+- **Commit:** `3a69dc9`.
+- **Git:** `origin/main`, working tree clean.
+- **Weryfikacja:** 958 passed, 0 failed, 0 skipped.
+- **Ruff:** linting i formatowanie PASSED.
+- **Mypy:** 32 pliki bez błędów.
+- **Rezultat:** przetestowany workflow tworzenia Approval Request i zapisywania decyzji operatora przez wspólny Composition Root.
+- **Ograniczenia:** brak produkcyjnego RBAC oraz integracji wznowienia LangGraph z wykonywaniem remediation przez MCP.
+
+### 2026-11-12 — Etap 1.7.8.11.35: Trusted Decision Read
+
+- **Status:** implementacja i weryfikacja zakończone; oczekuje na commit i push.
+- **Zakres:** rozszerzenie `ApprovalRepository` i `PostgresApprovalRepository` o `get_decision(request_id)`.
+- **Działanie:** zaufany odczyt zapisanej decyzji z PostgreSQL, rekonstrukcja `RemediationApprovalDecision`, normalizacja czasu do UTC.
+- **Semantyka:** brak decyzji → `None`; istniejąca decyzja → `APPROVED` lub `REJECTED`.
+- **Bezpieczeństwo:** nie zmieniono mechanizmu atomowego zapisu decyzji; odczyt nie stanowi jeszcze autoryzacji wykonania remediation.
+- **Testy:** rozszerzono testy jednostkowe i integracyjne repozytorium.
+- **Pełna regresja:** **968 passed, 0 failed, 0 skipped**.
+- **Kontrola jakości:** Ruff lint PASSED, Ruff format PASSED, Mypy PASSED (32 pliki).
+- **Migracje bazy danych:** nie były potrzebne.
+- **Następny krok:** Git commit i push, następnie projektowanie `ApprovalExecutionGuard` oraz mechanizmu atomic execution claim.

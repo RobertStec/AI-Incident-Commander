@@ -57,6 +57,9 @@ class InMemoryApprovalRepository:
     async def get_request(self, request_id: UUID) -> RemediationApprovalRequest | None:
         return self.requests.get(request_id)
 
+    async def get_decision(self, request_id: UUID) -> RemediationApprovalDecision | None:
+        return self.decisions.get(request_id)
+
     async def record_decision_once(self, decision: RemediationApprovalDecision) -> None:
         self._record_attempt_count += 1
         self.record_attempt_started.set()
@@ -123,15 +126,50 @@ def test_repository_supports_structural_protocol() -> None:
 def test_repository_operations_are_asynchronous() -> None:
     assert inspect.iscoroutinefunction(ApprovalRepository.create_request)
     assert inspect.iscoroutinefunction(ApprovalRepository.get_request)
+    assert inspect.iscoroutinefunction(ApprovalRepository.get_decision)
     assert inspect.iscoroutinefunction(ApprovalRepository.record_decision_once)
     assert inspect.iscoroutinefunction(InMemoryApprovalRepository.create_request)
     assert inspect.iscoroutinefunction(InMemoryApprovalRepository.get_request)
+    assert inspect.iscoroutinefunction(InMemoryApprovalRepository.get_decision)
     assert inspect.iscoroutinefunction(InMemoryApprovalRepository.record_decision_once)
 
 
 def test_unknown_request_returns_none() -> None:
     repository: ApprovalRepository = _make_repository()
     assert asyncio.run(repository.get_request(uuid4())) is None
+
+
+def test_get_decision_returns_none_for_missing_request() -> None:
+    repository: ApprovalRepository = _make_repository()
+    assert asyncio.run(repository.get_decision(uuid4())) is None
+
+
+def test_get_decision_returns_none_before_decision() -> None:
+    repository: ApprovalRepository = _make_repository()
+    request = _make_request()
+
+    async def scenario() -> None:
+        await repository.create_request(request)
+        assert await repository.get_decision(request.request_id) is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [RemediationApprovalOutcome.APPROVED, RemediationApprovalOutcome.REJECTED],
+)
+def test_get_decision_returns_persisted_result(outcome: RemediationApprovalOutcome) -> None:
+    repository: ApprovalRepository = _make_repository()
+    request = _make_request()
+    decision = _make_decision(request.request_id, outcome)
+
+    async def scenario() -> None:
+        await repository.create_request(request)
+        await repository.record_decision_once(decision)
+        assert await repository.get_decision(request.request_id) == decision
+
+    asyncio.run(scenario())
 
 
 def test_duplicate_request_is_rejected_without_overwrite() -> None:

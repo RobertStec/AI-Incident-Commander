@@ -959,3 +959,186 @@ def test_record_decision_once_rolls_back_unexpected_primary_key_violation() -> N
                     await engine.dispose()
 
     asyncio.run(run_scenario())
+
+
+@pytest.mark.parametrize("request_exists", [False, True])
+def test_get_decision_returns_none_without_recorded_decision(request_exists: bool) -> None:
+    """Distinguish a missing decision from both present and absent requests."""
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        request = _make_request()
+        engine = create_database_engine(DatabaseConfig.from_environment())
+        try:
+            repository = PostgresApprovalRepository(engine=engine)
+            if request_exists:
+                await repository.create_request(request)
+
+            assert await repository.get_decision(request.request_id) is None
+        finally:
+            try:
+                await _delete_test_request(engine, request.request_id)
+            finally:
+                await engine.dispose()
+
+    asyncio.run(run_scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [RemediationApprovalOutcome.APPROVED, RemediationApprovalOutcome.REJECTED],
+)
+def test_get_decision_restores_committed_decision(outcome: RemediationApprovalOutcome) -> None:
+    """Rebuild the entire decision using an independent engine after commit."""
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        config = DatabaseConfig.from_environment()
+        writer_engine = create_database_engine(config)
+        reader_engine = create_database_engine(config)
+        request = _make_request()
+        try:
+            async with writer_engine.connect() as connection:
+                database_now = await connection.scalar(sa.select(sa.func.clock_timestamp()))
+            assert isinstance(database_now, datetime)
+            database_now = database_now.astimezone(UTC)
+
+            request = replace(
+                request,
+                requested_at=database_now - timedelta(minutes=5),
+                expires_at=database_now + timedelta(minutes=25),
+            )
+            decision = RemediationApprovalDecision(
+                request_id=request.request_id,
+                operator_id="get-decision-integration-operator",
+                outcome=outcome,
+                decided_at=database_now,
+                reason="Read the committed decision through another engine.",
+            )
+
+            writer = PostgresApprovalRepository(engine=writer_engine)
+            reader = PostgresApprovalRepository(engine=reader_engine)
+            await writer.create_request(request)
+            await writer.record_decision_once(decision)
+
+            restored = await reader.get_decision(request.request_id)
+            assert isinstance(restored, RemediationApprovalDecision)
+            assert restored is not decision
+            assert restored == decision
+            assert restored.decided_at.tzinfo is UTC
+        finally:
+            try:
+                await _delete_test_request(writer_engine, request.request_id)
+            finally:
+                try:
+                    await reader_engine.dispose()
+                finally:
+                    await writer_engine.dispose()
+
+    asyncio.run(run_scenario())
+
+
+def test_get_decision_normalizes_non_utc_session_timestamp() -> None:
+    """Restore UTC despite PostgreSQL returning Asia/Tokyo TIMESTAMPTZ."""
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        config = DatabaseConfig.from_environment()
+        engine = create_async_engine(
+            config.url,
+            connect_args={"options": "-c TimeZone=Asia/Tokyo"},
+            hide_parameters=True,
+        )
+        request = _make_request()
+        try:
+            async with engine.connect() as connection:
+                database_now = await connection.scalar(sa.select(sa.func.clock_timestamp()))
+            assert isinstance(database_now, datetime)
+            assert database_now.utcoffset() == timedelta(hours=9)
+            utc_now = database_now.astimezone(UTC)
+            request = replace(
+                request,
+                requested_at=utc_now - timedelta(minutes=5),
+                expires_at=utc_now + timedelta(minutes=25),
+            )
+            decision = RemediationApprovalDecision(
+                request_id=request.request_id,
+                operator_id="tokyo-integration-operator",
+                outcome=RemediationApprovalOutcome.APPROVED,
+                decided_at=utc_now,
+                reason="Verify UTC normalization when reading decisions.",
+            )
+
+            repository = PostgresApprovalRepository(engine=engine)
+            await repository.create_request(request)
+            await repository.record_decision_once(decision)
+
+            async with engine.connect() as connection:
+                raw_decided_at = await connection.scalar(
+                    sa.select(approval_decisions_table.c.decided_at).where(
+                        approval_decisions_table.c.request_id == request.request_id
+                    )
+                )
+            assert isinstance(raw_decided_at, datetime)
+            assert raw_decided_at.utcoffset() == timedelta(hours=9)
+
+            restored = await repository.get_decision(request.request_id)
+            assert restored == decision
+            assert restored is not None
+            assert restored.decided_at.tzinfo is UTC
+        finally:
+            try:
+                await _delete_test_request(engine, request.request_id)
+            finally:
+                await engine.dispose()
+
+    asyncio.run(run_scenario())
+
+
+def test_get_decision_does_not_modify_persisted_record() -> None:
+    """Read-only decision access must not alter the stored audit row."""
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        engine = create_database_engine(DatabaseConfig.from_environment())
+        request = _make_request()
+        try:
+            async with engine.connect() as connection:
+                database_now = await connection.scalar(sa.select(sa.func.clock_timestamp()))
+            assert isinstance(database_now, datetime)
+            database_now = database_now.astimezone(UTC)
+            request = replace(
+                request,
+                requested_at=database_now - timedelta(minutes=5),
+                expires_at=database_now + timedelta(minutes=25),
+            )
+            decision = RemediationApprovalDecision(
+                request_id=request.request_id,
+                operator_id="read-only-integration-operator",
+                outcome=RemediationApprovalOutcome.REJECTED,
+                decided_at=database_now,
+                reason="Reading should not alter database state.",
+            )
+            repository = PostgresApprovalRepository(engine=engine)
+            await repository.create_request(request)
+            await repository.record_decision_once(decision)
+
+            statement = sa.select(approval_decisions_table).where(
+                approval_decisions_table.c.request_id == request.request_id
+            )
+            async with engine.connect() as connection:
+                before = dict((await connection.execute(statement)).mappings().one())
+
+            assert await repository.get_decision(request.request_id) == decision
+
+            async with engine.connect() as connection:
+                after = dict((await connection.execute(statement)).mappings().one())
+
+            assert after == before
+        finally:
+            try:
+                await _delete_test_request(engine, request.request_id)
+            finally:
+                await engine.dispose()
+
+    asyncio.run(run_scenario())

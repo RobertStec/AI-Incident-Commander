@@ -46,6 +46,13 @@ class ApprovalRepository(Protocol):
         """Retrieve a request, returning None when it does not exist."""
         ...
 
+    async def get_decision(
+        self,
+        request_id: UUID,
+    ) -> RemediationApprovalDecision | None:
+        """Retrieve the recorded decision for a request, or None if absent."""
+        ...
+
     async def record_decision_once(
         self,
         decision: RemediationApprovalDecision,
