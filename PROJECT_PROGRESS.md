@@ -6,7 +6,8 @@
 
 ## 1. Bieżący stan
 
-- **Zakończony etap:** Status: 1.7.8.11.31 — zakończony technicznie, oczekuje na wersjonowanie w Git.
+- **Status:** 958 testów zaliczonych. Etapy 1.7.8.11.32–1.7.8.11.34 zakończone technicznie, pozostało wersjonowanie.
+- **Następny etap:** zakończony etap na 1.7.8.11.34, ze statusem „zweryfikowany, oczekuje na wersjonowanie”.
 
 ## 2. Ustalone decyzje architektoniczne
 
@@ -146,3 +147,39 @@ Testy integracyjne powinny objąć co najmniej:
 - **Ograniczenie:** rzeczywisty mechanizm uwierzytelniania i produkcyjny adapter autoryzacji/RBAC nie są jeszcze zaimplementowane.
 - **Pozostało:** commit i push.
 - **Następny krok:** wybór kolejnego etapu rozwoju Human-in-the-Loop.
+
+### 2026-11-11 — Zakończenie etapu 1.7.8.11.31
+
+- **Status:** zakończony, przetestowany i zapisany w GitHub.
+- **Commit:** `64e4e58`.
+- **Git Push:** zakończony pomyślnie.
+- **Working tree:** clean.
+- **Pełna regresja:** 938 passed, 0 failed, 0 skipped.
+- **Ruff i Mypy:** wszystkie kontrole zaliczone.
+- **Potwierdzono:** działanie Composition Root z rzeczywistym PostgreSQL, autoryzację decyzji i ochronę przed ponownym zapisem pomiędzy cyklami życia aplikacji.
+
+### 2026-11-11 — Etap 1.7.8.11.32: Approval Request Creation Service
+
+- **Status:** implementacja i testy jednostkowe zakończone.
+- **Nowe pliki:**
+  - `src/ai_incident_commander/application/approval_request_service.py`
+  - `tests/unit/test_approval_request_service.py`
+- **Architektura:** osobny serwis aplikacyjny wykorzystujący `ApprovalRepository`, `Clock`, `ActionCatalog` i `TargetResolver`.
+- **Przepływ:** zaufany Preflight → Action Fingerprint → walidacja czasu → utworzenie i zapis Approval Request.
+- **Zasada bezpieczeństwa:** błędy walidacji uniemożliwiają zapis żądania.
+- **Weryfikacja:** 12 nowych testów jednostkowych PASSED; pełna regresja **950 passed, 0 failed, 0 skipped**.
+- **Kontrola jakości:** Ruff lint PASSED, Ruff format PASSED, Mypy PASSED (32 pliki).
+- **Pozostało:** integracja z Composition Root, test integracyjny PostgreSQL, commit i push.
+
+### 2026-11-12 — Etapy 1.7.8.11.33–1.7.8.11.34: Approval Workflow Integration
+
+- **Status:** implementacja i weryfikacja zakończone; oczekuje na commit i push.
+- **Composition Root:** dodano `ApprovalServices` i `approval_workflow_lifespan()`.
+- **Architektura:** `ApprovalApplicationService` oraz `ApprovalRequestCreationService` współdzielą `PostgresApprovalRepository`, `SystemClock` i `AsyncEngine`.
+- **Kompatybilność:** zachowano dotychczasowy `approval_service_lifespan()`.
+- **Testy jednostkowe:** rozszerzono `tests/unit/test_bootstrap.py` o 7 scenariuszy.
+- **Testy integracyjne:** dodano pełny scenariusz tworzenia Approval Request i zapisywania decyzji w rzeczywistym PostgreSQL.
+- **Pełna regresja:** **958 passed, 0 failed, 0 skipped**.
+- **Kontrola jakości:** Ruff lint PASSED, Ruff format PASSED, Mypy PASSED (32 pliki).
+- **Ograniczenia:** produkcyjne uwierzytelnianie/RBAC oraz wykonanie remediation przez MCP pozostają do implementacji.
+- **Następny krok:** przegląd zmian Git, commit i push.

@@ -9,16 +9,29 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from ai_incident_commander.application.action_fingerprint import create_action_fingerprint
+from ai_incident_commander.application.action_policy_version import create_action_policy_version
 from ai_incident_commander.application.approval_authorization import (
     ApprovalPermissionDeniedError,
     AuthenticatedOperatorContext,
 )
 from ai_incident_commander.application.approval_repository import ApprovalAlreadyDecidedError
-from ai_incident_commander.bootstrap import approval_service_lifespan
+from ai_incident_commander.application.remediation_preflight import RemediationPreflightResult
+from ai_incident_commander.bootstrap import (
+    approval_service_lifespan,
+    approval_workflow_lifespan,
+)
+from ai_incident_commander.domain.action_catalog import (
+    ActionCatalog,
+    ActionDefinition,
+    ActionEffect,
+)
+from ai_incident_commander.domain.remediation import RemediationRiskLevel, RemediationStep
 from ai_incident_commander.domain.remediation_approval import (
     RemediationApprovalOutcome,
     RemediationApprovalRequest,
 )
+from ai_incident_commander.domain.target_identity import ResolvedTarget
 from ai_incident_commander.infrastructure.approval_tables import (
     approval_decisions_table,
     approval_requests_table,
@@ -53,6 +66,18 @@ class SingleOperatorAuthorizer:
         self.calls.append((operator, request, outcome))
         if operator.operator_id != self._allowed_operator_id:
             raise ApprovalPermissionDeniedError("Test operator is not authorized.")
+
+
+class StaticTargetResolver:
+    """Test-only resolver providing a verified lab resource identity."""
+
+    def __init__(self, result: ResolvedTarget) -> None:
+        self._result = result
+        self.calls: list[tuple[str, str]] = []
+
+    async def resolve(self, *, target: str, environment: str) -> ResolvedTarget:
+        self.calls.append((target, environment))
+        return self._result
 
 
 async def _remove_test_request(engine: AsyncEngine, request_id: UUID) -> None:
@@ -290,6 +315,132 @@ def test_composition_root_rejects_second_decision_across_lifespans() -> None:
         finally:
             try:
                 await _remove_test_request(setup_engine, request_id)
+            finally:
+                await setup_engine.dispose()
+
+    asyncio.run(run_scenario())
+
+
+def test_workflow_creates_request_and_records_decision_in_postgres() -> None:
+    """Create and decide on one preflighted action through the full workflow."""
+    if os.environ.get("RUN_DB_APPROVAL_TESTS") != "1":
+        pytest.skip("Set RUN_DB_APPROVAL_TESTS=1 to enable approval database tests")
+
+    async def run_scenario() -> None:
+        config = DatabaseConfig.from_environment()
+        setup_engine = create_database_engine(config)
+        step = RemediationStep(
+            plan_id=uuid4(),
+            position=1,
+            action_name="restart_service",
+            target="payments-api",
+            environment="incident-lab",
+            risk_level=RemediationRiskLevel.HIGH,
+        )
+        definition = ActionDefinition(
+            action_name="restart_service",
+            description="Restart the payments API in the incident lab.",
+            effect=ActionEffect.MUTATING,
+            risk_level=RemediationRiskLevel.HIGH,
+            allowed_environments=("incident-lab",),
+        )
+        catalog = ActionCatalog(definitions=(definition,))
+        resolved_target = ResolvedTarget(
+            target="payments-api",
+            resource_id="payments-api-integration-resource",
+            environment="incident-lab",
+            source="integration-test-inventory",
+        )
+        resolver = StaticTargetResolver(resolved_target)
+        operator = AuthenticatedOperatorContext(operator_id="workflow-integration-operator")
+        authorizer = SingleOperatorAuthorizer(allowed_operator_id=operator.operator_id)
+        validity_period = timedelta(minutes=30)
+        reason = "Approved after validated remediation preflight."
+        request_id: UUID | None = None
+
+        try:
+            async with approval_workflow_lifespan(
+                authorizer=authorizer,
+                catalog=catalog,
+                resolver=resolver,
+                validity_period=validity_period,
+                config=config,
+            ) as services:
+                request = await services.requests.create_for_step(step)
+                request_id = request.request_id
+                decision = await services.decisions.decide(
+                    request_id=request_id,
+                    operator=operator,
+                    outcome=RemediationApprovalOutcome.APPROVED,
+                    reason=reason,
+                )
+
+            # These are real production services. Only the trust-boundary inputs
+            # (authorization and external target inventory) are test doubles.
+            expected_fingerprint = create_action_fingerprint(
+                step,
+                RemediationPreflightResult(
+                    action=definition,
+                    target=resolved_target,
+                    step_snapshot=step,
+                    policy_version=create_action_policy_version(catalog),
+                ),
+            )
+            assert resolver.calls == [(step.target, step.environment)]
+            assert request.plan_id == step.plan_id
+            assert request.step_id == step.step_id
+            assert request.action_fingerprint == expected_fingerprint
+            assert request.policy_version == create_action_policy_version(catalog)
+            assert request.expires_at - request.requested_at == validity_period
+            assert authorizer.calls == [(operator, request, RemediationApprovalOutcome.APPROVED)]
+            assert decision.request_id == request_id
+            assert decision.operator_id == operator.operator_id
+            assert decision.outcome is RemediationApprovalOutcome.APPROVED
+            assert decision.reason == reason
+
+            # Verify durable writes using a separate engine after the workflow exits.
+            async with setup_engine.connect() as connection:
+                persisted_request = (
+                    (
+                        await connection.execute(
+                            sa.select(approval_requests_table).where(
+                                approval_requests_table.c.request_id == request_id
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                persisted_decision = (
+                    (
+                        await connection.execute(
+                            sa.select(approval_decisions_table).where(
+                                approval_decisions_table.c.request_id == request_id
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+
+            assert persisted_request["request_id"] == request_id
+            assert persisted_request["plan_id"] == step.plan_id
+            assert persisted_request["step_id"] == step.step_id
+            assert persisted_request["action_fingerprint"] == expected_fingerprint
+            assert persisted_request["policy_version"] == request.policy_version
+            assert persisted_request["requested_at"] == request.requested_at
+            assert persisted_request["expires_at"] == request.expires_at
+            assert persisted_decision["decision_id"] == decision.decision_id
+            assert persisted_decision["request_id"] == request_id
+            assert persisted_decision["operator_id"] == operator.operator_id
+            assert persisted_decision["outcome"] == RemediationApprovalOutcome.APPROVED.value
+            assert persisted_decision["reason"] == reason
+            assert persisted_decision["decided_at"] == decision.decided_at
+            assert request.requested_at <= persisted_decision["recorded_at"] < request.expires_at
+        finally:
+            try:
+                if request_id is not None:
+                    await _remove_test_request(setup_engine, request_id)
             finally:
                 await setup_engine.dispose()
 
