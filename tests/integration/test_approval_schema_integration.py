@@ -1,4 +1,4 @@
-"""Read-only integration checks for the PostgreSQL approval schema."""
+"""Read-only checks for the PostgreSQL approval and execution claim schema."""
 
 import asyncio
 import os
@@ -13,6 +13,7 @@ from ai_incident_commander.infrastructure.approval_tables import (
 )
 from ai_incident_commander.infrastructure.database_config import DatabaseConfig
 from ai_incident_commander.infrastructure.database_engine import create_database_engine
+from ai_incident_commander.infrastructure.execution_claim_tables import execution_claims_table
 
 
 def _assert_schema_matches_metadata(connection: Connection, table: sa.Table) -> None:
@@ -82,8 +83,8 @@ def _assert_schema_matches_metadata(connection: Connection, table: sa.Table) -> 
 
 @pytest.mark.parametrize(
     "table",
-    (approval_requests_table, approval_decisions_table),
-    ids=("requests", "decisions"),
+    (approval_requests_table, approval_decisions_table, execution_claims_table),
+    ids=("requests", "decisions", "execution-claims"),
 )
 def test_live_approval_schema_matches_metadata(table: sa.Table) -> None:
     """Inspect PostgreSQL only when integration tests are explicitly enabled."""

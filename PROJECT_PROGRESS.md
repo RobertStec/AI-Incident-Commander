@@ -1,209 +1,87 @@
 # AI Incident Commander — Project Progress
 
-> **Cel pliku:** krótka, aktualna pamięć techniczna projektu, którą można przenieść do nowej konwersacji.
-> **Dokument nadrzędny:** `PROJECT_BRIEF.md` (wizja, wymagania i roadmapa).
-> **Zasada:** zapisujemy tylko fakty potwierdzone w kodzie/testach, ważne decyzje oraz informacje potrzebne do wznowienia pracy. Nie traktujemy planów jako ukończonej implementacji.
+> **Cel:** zwięzła pamięć techniczna projektu, umożliwiająca wznowienie pracy w nowej konwersacji.
+> **Dokument nadrzędny:** `PROJECT_BRIEF.md` — wizja, wymagania i roadmapa.
+> **Zasada aktualizacji:** wpisy tylko przy **istotnych kamieniach milowych architektury**, zmianach kluczowych kontraktów lub decyzjach bezpieczeństwa. Nie dokumentujemy osobno każdego testu, drobnej poprawki, etapu pośredniego ani commita.
+> **Źródło szczegółowej historii zmian:** Git i testy w repozytorium. Nie oznaczamy planów jako ukończonej implementacji.
 
-## 1. Bieżący stan
+## 1. Aktualny stan projektu
 
-- **Status:** 968 testów zaliczonych. Etap 1.7.8.11.35 — zakończony technicznie, pozostało wersjonowanie.
-- **Następny etap:** zakończony etap na 1.7.8.11.35 jako zweryfikowany, oczekujący na wersjonowanie.
+- **Obszar:** Human-in-the-Loop — zabezpieczenie wykonania operacji remediation.
+- **Ostatni kamień milowy:** **Atomic Execution Claim** (`1.7.8.11.38`) — zaimplementowany i zweryfikowany na PostgreSQL; **commit i push jeszcze niewykonane**.
+- **Najnowsza pełna regresja:** **1020 passed, 0 failed, 0 skipped** (2026-11-12). Ruff lint/format: PASSED; Mypy: 37 plików, bez błędów.
+- **Migracja bazy:** `f4d2a6b8c901` zastosowana w lokalnej bazie PostgreSQL; test zgodności schematu przeszedł.
+- **Ostatni potwierdzony push przed zmianami Atomic Execution Claim:** `b4b9986` na `origin/main` (ApprovalExecutionGuard). Aktualnego stanu Git dla oczekujących zmian nie sprawdzono jeszcze po ostatniej regresji.
+- **Bezpośredni następny krok:** sprawdzić Git, zatwierdzić i wypchnąć zmiany Atomic Execution Claim; następnie zaprojektować serwis aplikacyjny łączący `ApprovalExecutionGuard` z `ExecutionClaimRepository.claim_once()`.
 
-## 2. Ustalone decyzje architektoniczne
+## 2. Kluczowe decyzje i granice bezpieczeństwa
 
-### Approval persistence — `record_decision_once()`
+- **Podział odpowiedzialności:** Preflight i fingerprint weryfikują operację; Approval Request/Decision przechowują decyzję człowieka; `ApprovalExecutionGuard` sprawdza zgodność zatwierdzenia z aktualnym krokiem; `ExecutionClaimRepository` rezerwuje wykonanie atomowo. Nie łączymy tych odpowiedzialności w jeden komponent.
+- **Zaufane zatwierdzenie:** decyzję odczytujemy z PostgreSQL (`get_decision()`), a nie z danych dostarczonych przez klienta, LangGraph lub MCP. Wymagana jest utrwalona decyzja `APPROVED`.
+- **Approval persistence:** `record_decision_once()` używa transakcji i `SELECT ... FOR UPDATE`; weryfikuje aktywność żądania według zegara PostgreSQL po uzyskaniu blokady. `UNIQUE(request_id)` uniemożliwia drugą decyzję; nieoczekiwane błędy SQL nie są maskowane.
+- **Powiązanie operacji:** Action Fingerprint obejmuje krok, parametry, zweryfikowany cel i wersję polityki. Guard ponawia zaufany Preflight i porównuje aktualny zakres z utrwalonym Approval Request.
+- **Approval window ≠ execution window:** `requested_at`/`expires_at` określają okno podjęcia decyzji; nie definiują odrębnego terminu wykonania. Polityka ważności wykonania pozostaje do zaprojektowania.
+- **Atomic Execution Claim:** identyfikator kroku `(plan_id, step_id)` jest unikalny niezależnie od `request_id`; dodatkowe `UNIQUE(request_id)` zapobiega wielokrotnemu użyciu jednego zatwierdzenia. Ponowienie `claim_once()` **odmawia** wydania kolejnego claimu, nawet dla identycznych argumentów.
+- **Autoryzacja w transakcji:** adapter claimów ponownie sprawdza utrwalone `APPROVED`, zgodność identyfikatorów, fingerprintu, polityki i czasu decyzji; dopiero następnie zapisuje claim. `claimed_at` pochodzi z `clock_timestamp()` PostgreSQL.
+- **Granica gwarancji:** claim nie jest wykonaniem MCP i nie zapewnia *exactly-once execution* w systemie zewnętrznym. Nadal potrzebne są: bezpieczne powiązanie Guard → Claim → Executor, idempotency/uzgadnianie stanu po stronie narzędzia, obsługa niepewnego rezultatu oraz zmian celu pomiędzy kontrolą a wykonaniem.
+- **Composition Root:** zależności wstrzykujemy jawnie; brak domyślnego autoryzatora `allow-all`. Życie `AsyncEngine` jest zarządzane przez async context manager; warstwa aplikacji nie zależy od FastAPI ani LangGraph.
 
-- Wykorzystujemy `AsyncEngine` i transakcję `async with engine.begin()`.
-- W obrębie transakcji blokujemy rekord żądania przez `SELECT ... FOR UPDATE` (bez `NOWAIT` i `SKIP LOCKED`), aby serializować konkurujące zapisy do tego samego `request_id`.
-- Kolejność rozstrzygnięć: brak żądania → istniejąca decyzja → nieaktywne okno czasowe → zapis.
-- Aktywność oceniamy względem zegara bazy po pozyskaniu blokady, **nie** względem `decision.decided_at`.
-- W zapisanym kodzie warunkowy `INSERT ... SELECT` używa `clock_timestamp()` i tej samej wartości do walidacji okna oraz kolumny `recorded_at`.
-- Ograniczenie `uq_approval_decisions_request_id` (`UNIQUE(request_id)`) stanowi dodatkową ochronę integralności.
-- Potwierdzone wyjątki kontraktu: `ApprovalRequestNotFoundError`, `ApprovalRequestNotActiveError`, `ApprovalAlreadyDecidedError`.
-- Wymagane zachowanie nieoczekiwanych błędów SQL: nie maskować ich błędami domenowymi.
+## 3. Kamienie milowe
 
-## 3. Pliki powiązane z bieżącym krokiem
+### 2026-11-11 — Organizacja testów i trwała persystencja zatwierdzeń
 
-- `src/ai_incident_commander/infrastructure/postgres_approval_repository.py` — adapter; istniejące `create_request()` i `get_request()` zachowane.
-- `src/ai_incident_commander/application/approval_repository.py` — port i wyjątki.
-- `src/ai_incident_commander/domain/remediation_approval.py` — modele żądań i decyzji.
-- `src/ai_incident_commander/infrastructure/approval_tables.py` — tabela żądań i decyzji, w tym `recorded_at` oraz `UNIQUE(request_id)`.
+- Rozdzielono testy na `tests/unit/` i `tests/integration/` (commit `5707724`).
+- Wdrożono `PostgresApprovalRepository`, transakcyjny `record_decision_once()`, ochronę współbieżności i kontrolę ważności według PostgreSQL. Przetestowano m.in. wygaśnięcie podczas oczekiwania na blokadę, konflikt operatorów i rollback (commit `097db9c`).
+- Rezultat: trwała, atomowa rejestracja maksymalnie jednej decyzji dla żądania.
 
-**Ważne:** przy kolejnych zmianach w kodzie zawsze prosimy o *cały aktualny plik*, zamiast zakładać jego zawartość na podstawie tego dokumentu.
+### 2026-11-11 — Composition Root i trwały Approval Application Service
 
-## 4. Co sprawdzić w następnym kroku
+- Dodano niezależny od frameworka Composition Root z jawnym wstrzykiwaniem autoryzatora i zarządzaniem cyklem życia `AsyncEngine` (`9f6963d`).
+- Zweryfikowano integracyjnie zapis decyzji przez serwis aplikacyjny z rzeczywistym PostgreSQL, odmowę dla nieuprawnionego operatora oraz pojedynczą decyzję między cyklami życia (`64e4e58`).
 
-Testy integracyjne powinny objąć co najmniej:
+### 2026-11-12 — Pełny przepływ Approval Request → Decision
 
-- Pomyślny zapis pierwszej decyzji dla aktywnego żądania.
-- Brak żądania.
-- Żądanie wygasłe lub jeszcze nieaktywne (granice okna czasowego).
-- Powtórny zapis po istniejącej decyzji, również po wygaśnięciu żądania.
-- Dwie równoczesne decyzje operatorów o tym samym `request_id`: dokładnie jeden zapis.
-- `ROLLBACK` i poprawne mapowanie błędów integralności.
+- Dodano `ApprovalRequestCreationService`: zaufany Preflight → fingerprint → żądanie. `approval_workflow_lifespan()` współdzieli repozytorium, zegar i silnik pomiędzy serwisem żądań i decyzji (`3a69dc9`).
+- Przepływ od `RemediationStep` do utrwalonej decyzji został zweryfikowany integracyjnie; zachowano wcześniejszy kontrakt `approval_service_lifespan()`.
 
-## 5. Zasady pracy
+### 2026-11-12 — Trusted Decision Read
 
-- Pracujemy małymi krokami: jeden etap → cały aktualny plik → konkretna zmiana → test → analiza wyniku.
-- Nie oznaczamy etapu jako **zweryfikowany**, dopóki nie zobaczymy wyniku odpowiednich testów.
-- Kiedy pojawia się istotna decyzja lub przełom, asystent podaje gotowy fragment Markdown oznaczony **„Dodaj do `PROJECT_PROGRESS.md`:”**.
-- Użytkownik wkleja fragment do tego pliku w repozytorium / plikach projektu.
-- W nowej rozmowie warto udostępnić aktualny `PROJECT_PROGRESS.md` wraz z `PROJECT_BRIEF.md`.
+- Dodano `ApprovalRepository.get_decision(request_id)` i implementację PostgreSQL; odczyt odtwarza `RemediationApprovalDecision` i normalizuje czas do UTC.
+- Brak decyzji zwraca `None`; `APPROVED` i `REJECTED` pozostają rozróżnione. Bez migracji schematu.
+- Testy jednostkowe i integracyjne zakończone pomyślnie; commit `526b457`.
 
-## 6. Dziennik istotnych aktualizacji
+### 2026-11-12 — ApprovalExecutionGuard
 
-### 2026-11-11 — Etap 1.7.8.11.28
+- Oddzielny komponent sprawdza zapisane zatwierdzenie, tożsamość kroku, aktualny Preflight, wersję polityki i fingerprint; nie rezerwuje ani nie wykonuje operacji.
+- Zweryfikowano odmowę dla braku/odrzucenia decyzji i niezgodnego zakresu, również z rzeczywistym PostgreSQL.
+- **13 testów Guard** (9 jednostkowych, 4 integracyjne); commit `b4b9986` wypchnięty na `origin/main`.
 
-- **Typ:** implementacja przygotowana, podmiana potwierdzona przez użytkownika.
-- **Zakres:** `PostgresApprovalRepository.record_decision_once()`.
-- **Decyzja:** transakcyjny `SELECT FOR UPDATE`, sprawdzenie aktywności po blokadzie, wymuszenie `UNIQUE(request_id)`.
-- **Pozostało:** rzeczywiste testy integracyjne PostgreSQL i weryfikacja współbieżności.
+### 2026-11-12 — Atomic Execution Claim
 
-### 2026-11-11 — Etap 1.7.8.11.28a: Reorganizacja testów
+- Dodano niezmienny model `ExecutionClaim`, port `ExecutionClaimRepository.claim_once()` i `PostgresExecutionClaimRepository`.
+- Dodano tabelę `remediation_execution_claims`, `UNIQUE(plan_id, step_id)` i `UNIQUE(request_id)` oraz migrację Alembic `f4d2a6b8c901`; migracja zastosowana lokalnie i sprawdzona testami schematu.
+- Adapter w jednej transakcji weryfikuje utrwaloną decyzję `APPROVED`, zgodność zakresu i atomowo zapisuje rezerwację. `claimed_at` nadaje PostgreSQL.
+- Testy integracyjne wykazały **jednego zwycięzcę** przy równoczesnym claimie z tym samym `request_id` oraz z różnymi zatwierdzeniami dla tego samego kroku.
+- **Pełna regresja: 1020 passed; Ruff i Mypy: PASSED.**
+- **Status: zweryfikowany technicznie; jeszcze niezatwierdzony i niewypchnięty w Git.**
 
-- **Status:** zakończony i zweryfikowany testami.
-- **Decyzja architektoniczna:** podział testów na `tests/unit/` oraz `tests/integration/`.
-- **Wykonane zmiany:**
-  - Przeniesiono 22 pliki do `tests/unit/`.
-  - Przeniesiono 2 pliki do `tests/integration/`.
-  - Zachowano istniejącą konfigurację pytest.
-  - Nie zmieniano logiki testów ani kodu aplikacji.
-- **Weryfikacja:**
-  - Testy jednostkowe: 913 passed.
-  - Pełny pytest: 913 passed, 8 skipped, 0 failed.
-  - Pominięte testy: 6 testów repozytorium PostgreSQL i 2 testy schematu.
-- **Pozostało:** sprawdzenie śledzenia plików przez Git oraz uruchomienie testów integracyjnych na rzeczywistym PostgreSQL.
-- **Następny etap:** `1.7.8.11.29` — testy integracyjne `PostgresApprovalRepository.record_decision_once()`.
+## 4. Co pozostało do zaprojektowania
 
-### 2026-11-11 — Etap 1.7.8.11.29: Testy integracyjne record_decision_once()
+- **Najbliżej:** serwis aplikacyjny koordynujący `ApprovalExecutionGuard` i atomowe `claim_once()`; testy integracji oraz zachowania przy błędach i retry.
+- **Przed uruchamianiem MCP:** lifecycle wykonania, trwały status, kontrola niepewnego wyniku, idempotency downstream, zachowanie przy restartach LangGraph i zmianie tożsamości zasobu.
+- **Dalsze prace:** rzeczywiste uwierzytelnianie i produkcyjny RBAC, integracja HITL/LangGraph, adaptery MCP i pozostałe elementy roadmapy z `PROJECT_BRIEF.md`.
 
-- **Status:** zakończony i zweryfikowany na rzeczywistym PostgreSQL.
-- **Zakres:** `PostgresApprovalRepository.record_decision_once()`.
-- **Potwierdzone scenariusze:**
-  - Pierwszy zapis decyzji dla aktywnego żądania.
-  - Odrzucenie decyzji dla nieistniejącego żądania.
-  - Odrzucenie decyzji dla wygasłego żądania, także przy cofniętym `decided_at`.
-  - Odrzucenie decyzji przed początkiem okna aktywności.
-  - Odrzucenie drugiej decyzji bez nadpisywania pierwszej.
-  - Priorytet istniejącej decyzji nad wygaśnięciem żądania.
-  - Równoczesne decyzje dwóch operatorów — dokładnie jeden skuteczny zapis.
-  - Wygaśnięcie podczas oczekiwania na blokadę PostgreSQL.
-  - ROLLBACK po nieoczekiwanym naruszeniu klucza głównego.
-- **Wyniki testów:**
-  - 913 testów jednostkowych — PASSED.
-  - 15 testów integracyjnych repozytorium — PASSED.
-  - 2 testy integracyjne schematu PostgreSQL — PASSED.
-  - Pełna regresja: **930 passed, 0 failed, 0 skipped**.
-- **Decyzja architektoniczna:** utrzymujemy transakcyjny zapis decyzji z `SELECT FOR UPDATE`, kontrolą czasu PostgreSQL po uzyskaniu blokady oraz `UNIQUE(request_id)`.
-- **Pozostało:** przegląd zmian Git, commit i push.
-- **Następny krok:** zakończenie wersjonowania implementacji PostgreSQL approval persistence.
+## 5. Wznowienie pracy i zasady współpracy
 
-### 2026-11-11 — Zakończenie PostgreSQL Approval Persistence
+- Przed każdą zmianą istniejącego pliku analizujemy **cały aktualny plik**; nie rekonstruujemy kodu z tego dokumentu.
+- Pracujemy iteracyjnie: mała zmiana → testy odpowiednie dla warstwy → analiza wyniku → dalszy krok. Maksymalnie 8 plików testowych na jedną partię.
+- Testy integracyjne wymagają lokalnej, izolowanej bazy PostgreSQL. Używane polecenie pełnej regresji:
 
-- **Status:** implementacja, testy integracyjne i wersjonowanie zakończone.
-- **Pełna regresja:** 930 passed, 0 failed, 0 skipped.
-- **Commit:** `097db9c`.
-- **Git Push:** zakończony pomyślnie (`origin/main`).
-- **Working tree:** clean.
-- **Zakończone etapy:** `1.7.8.11.28`, `1.7.8.11.28a`, `1.7.8.11.29`.
-- **Następny obszar:** integracja trwałego repozytorium zatwierdzeń z warstwą aplikacyjną i pozostałymi komponentami Human-in-the-Loop.
+  ```bash
+  RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1 \
+  uv run --env-file .env pytest -q
+  ```
 
-### 2026-11-11 — Etap 1.7.8.11.30: Composition Root
-
-- **Status:** implementacja zakończona, testy i kontrola jakości zaliczone.
-- **Nowe pliki:**
-  - `src/ai_incident_commander/bootstrap.py`
-  - `tests/unit/test_bootstrap.py`
-- **Decyzje architektoniczne:**
-  - Composition Root niezależny od FastAPI i LangGraph.
-  - Jawne Dependency Injection przez istniejące porty aplikacyjne.
-  - `ApprovalAuthorizer` jest wymagany — brak domyślnej autoryzacji `allow-all`.
-  - `AsyncEngine` jest zarządzany przez asynchroniczny context manager i zamykany przez `dispose()`.
-  - Zachowano rozdzielenie warstw application i infrastructure.
-- **Weryfikacja:**
-  - 5 nowych testów jednostkowych — PASSED.
-  - Pełna regresja: 935 passed, 0 failed, 0 skipped.
-  - Ruff linting — PASSED.
-  - Ruff formatting — 56 plików poprawnie sformatowanych.
-  - Mypy — 31 plików, brak błędów.
-- **Ograniczenie:** nie przeprowadzono jeszcze testu integracyjnego `ApprovalApplicationService` utworzonego przez Composition Root na rzeczywistym PostgreSQL.
-- **Następny krok:** commit i push, następnie integracyjny test pełnego cyklu zatwierdzania.
-
-### 2026-11-11 — Etap 1.7.8.11.31: Integration Test Composition Root
-
-- **Status:** implementacja testów i weryfikacja zakończone.
-- **Nowy plik:** `tests/integration/test_bootstrap_integration.py`.
-- **Zakres:** pełna integracja `approval_service_lifespan()` → `ApprovalApplicationService.decide()` → `PostgresApprovalRepository` → PostgreSQL.
-- **Potwierdzone scenariusze:**
-  - Uprawniony operator może zapisać decyzję.
-  - Nieuprawniony operator otrzymuje `ApprovalPermissionDeniedError`, bez zapisu decyzji.
-  - Ponowne utworzenie Composition Root nie pozwala nadpisać istniejącej decyzji (`ApprovalAlreadyDecidedError`).
-- **Weryfikacja:**
-  - Testy jednostkowe: 918 passed.
-  - Testy integracyjne PostgreSQL: 20 passed.
-  - Pełna regresja: **938 passed, 0 failed, 0 skipped**.
-  - Ruff linting i formatowanie: PASSED.
-  - Mypy: 31 plików, brak błędów.
-- **Ograniczenie:** rzeczywisty mechanizm uwierzytelniania i produkcyjny adapter autoryzacji/RBAC nie są jeszcze zaimplementowane.
-- **Pozostało:** commit i push.
-- **Następny krok:** wybór kolejnego etapu rozwoju Human-in-the-Loop.
-
-### 2026-11-11 — Zakończenie etapu 1.7.8.11.31
-
-- **Status:** zakończony, przetestowany i zapisany w GitHub.
-- **Commit:** `64e4e58`.
-- **Git Push:** zakończony pomyślnie.
-- **Working tree:** clean.
-- **Pełna regresja:** 938 passed, 0 failed, 0 skipped.
-- **Ruff i Mypy:** wszystkie kontrole zaliczone.
-- **Potwierdzono:** działanie Composition Root z rzeczywistym PostgreSQL, autoryzację decyzji i ochronę przed ponownym zapisem pomiędzy cyklami życia aplikacji.
-
-### 2026-11-11 — Etap 1.7.8.11.32: Approval Request Creation Service
-
-- **Status:** implementacja i testy jednostkowe zakończone.
-- **Nowe pliki:**
-  - `src/ai_incident_commander/application/approval_request_service.py`
-  - `tests/unit/test_approval_request_service.py`
-- **Architektura:** osobny serwis aplikacyjny wykorzystujący `ApprovalRepository`, `Clock`, `ActionCatalog` i `TargetResolver`.
-- **Przepływ:** zaufany Preflight → Action Fingerprint → walidacja czasu → utworzenie i zapis Approval Request.
-- **Zasada bezpieczeństwa:** błędy walidacji uniemożliwiają zapis żądania.
-- **Weryfikacja:** 12 nowych testów jednostkowych PASSED; pełna regresja **950 passed, 0 failed, 0 skipped**.
-- **Kontrola jakości:** Ruff lint PASSED, Ruff format PASSED, Mypy PASSED (32 pliki).
-- **Pozostało:** integracja z Composition Root, test integracyjny PostgreSQL, commit i push.
-
-### 2026-11-12 — Etapy 1.7.8.11.33–1.7.8.11.34: Approval Workflow Integration
-
-- **Status:** implementacja i weryfikacja zakończone; oczekuje na commit i push.
-- **Composition Root:** dodano `ApprovalServices` i `approval_workflow_lifespan()`.
-- **Architektura:** `ApprovalApplicationService` oraz `ApprovalRequestCreationService` współdzielą `PostgresApprovalRepository`, `SystemClock` i `AsyncEngine`.
-- **Kompatybilność:** zachowano dotychczasowy `approval_service_lifespan()`.
-- **Testy jednostkowe:** rozszerzono `tests/unit/test_bootstrap.py` o 7 scenariuszy.
-- **Testy integracyjne:** dodano pełny scenariusz tworzenia Approval Request i zapisywania decyzji w rzeczywistym PostgreSQL.
-- **Pełna regresja:** **958 passed, 0 failed, 0 skipped**.
-- **Kontrola jakości:** Ruff lint PASSED, Ruff format PASSED, Mypy PASSED (32 pliki).
-- **Ograniczenia:** produkcyjne uwierzytelnianie/RBAC oraz wykonanie remediation przez MCP pozostają do implementacji.
-- **Następny krok:** przegląd zmian Git, commit i push.
-
-### 2026-11-12 — Zakończenie etapów 1.7.8.11.32–1.7.8.11.34
-
-- **Status:** implementacja, testy, commit i push zakończone.
-- **Commit:** `3a69dc9`.
-- **Git:** `origin/main`, working tree clean.
-- **Weryfikacja:** 958 passed, 0 failed, 0 skipped.
-- **Ruff:** linting i formatowanie PASSED.
-- **Mypy:** 32 pliki bez błędów.
-- **Rezultat:** przetestowany workflow tworzenia Approval Request i zapisywania decyzji operatora przez wspólny Composition Root.
-- **Ograniczenia:** brak produkcyjnego RBAC oraz integracji wznowienia LangGraph z wykonywaniem remediation przez MCP.
-
-### 2026-11-12 — Etap 1.7.8.11.35: Trusted Decision Read
-
-- **Status:** implementacja i weryfikacja zakończone; oczekuje na commit i push.
-- **Zakres:** rozszerzenie `ApprovalRepository` i `PostgresApprovalRepository` o `get_decision(request_id)`.
-- **Działanie:** zaufany odczyt zapisanej decyzji z PostgreSQL, rekonstrukcja `RemediationApprovalDecision`, normalizacja czasu do UTC.
-- **Semantyka:** brak decyzji → `None`; istniejąca decyzja → `APPROVED` lub `REJECTED`.
-- **Bezpieczeństwo:** nie zmieniono mechanizmu atomowego zapisu decyzji; odczyt nie stanowi jeszcze autoryzacji wykonania remediation.
-- **Testy:** rozszerzono testy jednostkowe i integracyjne repozytorium.
-- **Pełna regresja:** **968 passed, 0 failed, 0 skipped**.
-- **Kontrola jakości:** Ruff lint PASSED, Ruff format PASSED, Mypy PASSED (32 pliki).
-- **Migracje bazy danych:** nie były potrzebne.
-- **Następny krok:** Git commit i push, następnie projektowanie `ApprovalExecutionGuard` oraz mechanizmu atomic execution claim.
+- Kontrole jakości: `uv run ruff check src/ tests/ migrations/versions/`, `uv run ruff format --check src/ tests/ migrations/versions/`, `uv run mypy src/ai_incident_commander/`.
+- `PROJECT_PROGRESS.md` aktualizujemy **wyłącznie przy znaczącym kamieniu milowym**; Git przechowuje zmiany szczegółowe. Każdy wpis rozróżnia: *zaplanowane*, *zaimplementowane*, *zweryfikowane*, *commit/push*.
+- W nowej rozmowie udostępnić `PROJECT_PROGRESS.md` i `PROJECT_BRIEF.md`; przed kolejną implementacją potwierdzić bieżący stan Git oraz kodu.
