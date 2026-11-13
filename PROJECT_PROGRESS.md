@@ -7,75 +7,79 @@
 
 ## 1. Aktualny stan projektu
 
-- **Obszar:** Human-in-the-Loop — zabezpieczenie wykonania operacji remediation.
-- **Ostatni kamień milowy:** **Atomic Execution Claim** (`1.7.8.11.38`) — zaimplementowany i zweryfikowany na PostgreSQL; **commit i push jeszcze niewykonane**.
-- **Najnowsza pełna regresja:** **1020 passed, 0 failed, 0 skipped** (2026-11-12). Ruff lint/format: PASSED; Mypy: 37 plików, bez błędów.
-- **Migracja bazy:** `f4d2a6b8c901` zastosowana w lokalnej bazie PostgreSQL; test zgodności schematu przeszedł.
-- **Ostatni potwierdzony push przed zmianami Atomic Execution Claim:** `b4b9986` na `origin/main` (ApprovalExecutionGuard). Aktualnego stanu Git dla oczekujących zmian nie sprawdzono jeszcze po ostatniej regresji.
-- **Bezpośredni następny krok:** sprawdzić Git, zatwierdzić i wypchnąć zmiany Atomic Execution Claim; następnie zaprojektować serwis aplikacyjny łączący `ApprovalExecutionGuard` z `ExecutionClaimRepository.claim_once()`.
+- **Obszar:** Human-in-the-Loop — kontrola zatwierdzeń, rezerwacji i trwałego stanu wykonania remediation.
+- **Ostatni kamień milowy:** **Durable Remediation Execution Lifecycle** (`1.7.8.11.40`) — model, port, schemat i adapter PostgreSQL zaimplementowane; testy jednostkowe, integracyjne i współbieżności zaliczone; **commit/push tego kamienia milowego oczekują**.
+- **Najnowsza pełna regresja:** **1109 passed** (2026-11-13). Ruff lint/format: PASSED (82 pliki); Mypy: PASSED (42 pliki źródłowe).
+- **Migracje PostgreSQL:** `f4d2a6b8c901` (Execution Claims) oraz `a31e5d79c204` (Execution Lifecycle) zastosowane lokalnie; testy zgodności schematów zaliczone.
+- **Git:** ostatni potwierdzony push `2ebea2a` na `origin/main` (Guard → Atomic Claim). Ostatnia kontrola wykazała **9 nowych, nieśledzonych plików** Execution Lifecycle; nie obejmowała jeszcze tej aktualizacji dokumentu.
+- **Bezpośredni następny krok:** dodać `PROJECT_PROGRESS.md` i 9 plików Execution Lifecycle do staging area, sprawdzić staged diff, wykonać commit/push. Następnie zaprojektować bezpieczną orkiestrację Claim → Execution Lifecycle, nadal bez wywołań MCP.
 
 ## 2. Kluczowe decyzje i granice bezpieczeństwa
 
-- **Podział odpowiedzialności:** Preflight i fingerprint weryfikują operację; Approval Request/Decision przechowują decyzję człowieka; `ApprovalExecutionGuard` sprawdza zgodność zatwierdzenia z aktualnym krokiem; `ExecutionClaimRepository` rezerwuje wykonanie atomowo. Nie łączymy tych odpowiedzialności w jeden komponent.
-- **Zaufane zatwierdzenie:** decyzję odczytujemy z PostgreSQL (`get_decision()`), a nie z danych dostarczonych przez klienta, LangGraph lub MCP. Wymagana jest utrwalona decyzja `APPROVED`.
-- **Approval persistence:** `record_decision_once()` używa transakcji i `SELECT ... FOR UPDATE`; weryfikuje aktywność żądania według zegara PostgreSQL po uzyskaniu blokady. `UNIQUE(request_id)` uniemożliwia drugą decyzję; nieoczekiwane błędy SQL nie są maskowane.
-- **Powiązanie operacji:** Action Fingerprint obejmuje krok, parametry, zweryfikowany cel i wersję polityki. Guard ponawia zaufany Preflight i porównuje aktualny zakres z utrwalonym Approval Request.
-- **Approval window ≠ execution window:** `requested_at`/`expires_at` określają okno podjęcia decyzji; nie definiują odrębnego terminu wykonania. Polityka ważności wykonania pozostaje do zaprojektowania.
-- **Atomic Execution Claim:** identyfikator kroku `(plan_id, step_id)` jest unikalny niezależnie od `request_id`; dodatkowe `UNIQUE(request_id)` zapobiega wielokrotnemu użyciu jednego zatwierdzenia. Ponowienie `claim_once()` **odmawia** wydania kolejnego claimu, nawet dla identycznych argumentów.
-- **Autoryzacja w transakcji:** adapter claimów ponownie sprawdza utrwalone `APPROVED`, zgodność identyfikatorów, fingerprintu, polityki i czasu decyzji; dopiero następnie zapisuje claim. `claimed_at` pochodzi z `clock_timestamp()` PostgreSQL.
-- **Granica gwarancji:** claim nie jest wykonaniem MCP i nie zapewnia *exactly-once execution* w systemie zewnętrznym. Nadal potrzebne są: bezpieczne powiązanie Guard → Claim → Executor, idempotency/uzgadnianie stanu po stronie narzędzia, obsługa niepewnego rezultatu oraz zmian celu pomiędzy kontrolą a wykonaniem.
-- **Composition Root:** zależności wstrzykujemy jawnie; brak domyślnego autoryzatora `allow-all`. Życie `AsyncEngine` jest zarządzane przez async context manager; warstwa aplikacji nie zależy od FastAPI ani LangGraph.
+- **Oddzielne odpowiedzialności:** zaufany Preflight i Action Fingerprint identyfikują operację; Approval Request/Decision rejestrują decyzję człowieka; `ApprovalExecutionGuard` weryfikuje zgodność; `ExecutionClaimRepository` atomowo rezerwuje krok; `RemediationExecutionRepository` utrwala przebieg pojedynczej próby.
+- **Zaufane zatwierdzenie:** decyzja `APPROVED` pochodzi z PostgreSQL (`get_decision()`), nie z klienta, LangGraph ani MCP. `record_decision_once()` chronią transakcja, `SELECT ... FOR UPDATE`, zegar bazy i `UNIQUE(request_id)`.
+- **Powiązanie zakresu:** fingerprint obejmuje krok, parametry, zweryfikowany cel i wersję polityki. Guard ponawia zaufany Preflight. `ExecutionClaimService` przekazuje `VerifiedExecutionScope` bez powtórnego Preflight; repozytorium ponownie weryfikuje zatwierdzenie i zakres w transakcji.
+- **Approval window ≠ execution window:** `requested_at`/`expires_at` opisują okno decyzji, nie odrębny termin wykonania. Polityka ważności wykonania pozostaje do zaprojektowania.
+- **Atomic Execution Claim:** `UNIQUE(plan_id, step_id)` oraz `UNIQUE(request_id)` zapobiegają ponownej rezerwacji. `claimed_at` pochodzi z PostgreSQL. Identyczny retry `claim_once()` kończy się odmową.
+- **Execution Claim ≠ Execution Lifecycle:** claim identyfikuje rezerwację; osobny `RemediationExecution` identyfikuje próbę i jej stan: `EXECUTING → SUCCEEDED / FAILED / UNKNOWN`. Jedna próba na `claim_id` (`UNIQUE(claim_id)`).
+- **Trwałość i współbieżność:** `start_once()` zatwierdza `EXECUTING` przed planowanym wywołaniem MCP i odmawia ponownego startu; `record_outcome_once()` zapisuje pierwszy wynik warunkowym `UPDATE` i nie pozwala go nadpisać; `get_by_claim_id()` wyłącznie odczytuje. Czas pochodzi z `clock_timestamp()` PostgreSQL. Obie operacje zapisu przeszły testy konkurujących workerów.
+- **Niepewny efekt zewnętrzny:** `EXECUTING` po restarcie nie jest pozwoleniem na retry; `UNKNOWN` wymaga odrębnego reconciliation. `FAILED` nie jest automatycznym dowodem braku skutków ubocznych. **Brak gwarancji exactly-once execution po stronie MCP**; wykonawca MCP, idempotency downstream i uzgadnianie rezultatów nie są jeszcze zaimplementowane.
+- **Composition Root i autoryzacja:** jawne zależności i lifecycle `AsyncEngine` bez uzależniania aplikacji od FastAPI/LangGraph. Brak produkcyjnego uwierzytelniania/RBAC i brak domyślnego autoryzatora `allow-all`.
 
 ## 3. Kamienie milowe
 
 ### 2026-11-11 — Organizacja testów i trwała persystencja zatwierdzeń
 
-- Rozdzielono testy na `tests/unit/` i `tests/integration/` (commit `5707724`).
-- Wdrożono `PostgresApprovalRepository`, transakcyjny `record_decision_once()`, ochronę współbieżności i kontrolę ważności według PostgreSQL. Przetestowano m.in. wygaśnięcie podczas oczekiwania na blokadę, konflikt operatorów i rollback (commit `097db9c`).
-- Rezultat: trwała, atomowa rejestracja maksymalnie jednej decyzji dla żądania.
+- Rozdzielono testy na `tests/unit/` i `tests/integration/`.
+- `PostgresApprovalRepository`: atomowe `record_decision_once()`, ochrona współbieżności, sprawdzanie aktywności żądania według PostgreSQL, rollback i kontrola konfliktów.
+- **Rezultat:** co najwyżej jedna trwała decyzja na Approval Request; zweryfikowane testami integracyjnymi.
 
-### 2026-11-11 — Composition Root i trwały Approval Application Service
+### 2026-11-11 — Composition Root i Approval Application Service
 
-- Dodano niezależny od frameworka Composition Root z jawnym wstrzykiwaniem autoryzatora i zarządzaniem cyklem życia `AsyncEngine` (`9f6963d`).
-- Zweryfikowano integracyjnie zapis decyzji przez serwis aplikacyjny z rzeczywistym PostgreSQL, odmowę dla nieuprawnionego operatora oraz pojedynczą decyzję między cyklami życia (`64e4e58`).
+- Dodano niezależny od frameworka Composition Root z jawnym wstrzykiwaniem autoryzatora oraz cyklem życia `AsyncEngine`.
+- Zweryfikowano zapis decyzji z PostgreSQL, odmowę dla nieuprawnionego operatora i ochronę przed drugą decyzją między cyklami życia.
 
-### 2026-11-12 — Pełny przepływ Approval Request → Decision
+### 2026-11-12 — Approval Request → Decision i Trusted Decision Read
 
-- Dodano `ApprovalRequestCreationService`: zaufany Preflight → fingerprint → żądanie. `approval_workflow_lifespan()` współdzieli repozytorium, zegar i silnik pomiędzy serwisem żądań i decyzji (`3a69dc9`).
-- Przepływ od `RemediationStep` do utrwalonej decyzji został zweryfikowany integracyjnie; zachowano wcześniejszy kontrakt `approval_service_lifespan()`.
-
-### 2026-11-12 — Trusted Decision Read
-
-- Dodano `ApprovalRepository.get_decision(request_id)` i implementację PostgreSQL; odczyt odtwarza `RemediationApprovalDecision` i normalizuje czas do UTC.
-- Brak decyzji zwraca `None`; `APPROVED` i `REJECTED` pozostają rozróżnione. Bez migracji schematu.
-- Testy jednostkowe i integracyjne zakończone pomyślnie; commit `526b457`.
+- `ApprovalRequestCreationService`: zaufany Preflight → fingerprint → żądanie; wspólny lifecycle serwisów tworzenia żądania i decyzji.
+- `ApprovalRepository.get_decision()` zwraca utrwalone `APPROVED`/`REJECTED` lub `None`, z normalizacją czasu UTC. Przepływ sprawdzono integracyjnie.
 
 ### 2026-11-12 — ApprovalExecutionGuard
 
-- Oddzielny komponent sprawdza zapisane zatwierdzenie, tożsamość kroku, aktualny Preflight, wersję polityki i fingerprint; nie rezerwuje ani nie wykonuje operacji.
-- Zweryfikowano odmowę dla braku/odrzucenia decyzji i niezgodnego zakresu, również z rzeczywistym PostgreSQL.
-- **13 testów Guard** (9 jednostkowych, 4 integracyjne); commit `b4b9986` wypchnięty na `origin/main`.
+- Guard weryfikuje utrwalone zatwierdzenie, tożsamość kroku, aktualny Preflight, fingerprint i politykę; sam nie rezerwuje i nie wykonuje operacji.
+- Przetestowano odmowy dla braku/odrzucenia decyzji oraz zmiany zakresu, także na PostgreSQL.
 
 ### 2026-11-12 — Atomic Execution Claim
 
-- Dodano niezmienny model `ExecutionClaim`, port `ExecutionClaimRepository.claim_once()` i `PostgresExecutionClaimRepository`.
-- Dodano tabelę `remediation_execution_claims`, `UNIQUE(plan_id, step_id)` i `UNIQUE(request_id)` oraz migrację Alembic `f4d2a6b8c901`; migracja zastosowana lokalnie i sprawdzona testami schematu.
-- Adapter w jednej transakcji weryfikuje utrwaloną decyzję `APPROVED`, zgodność zakresu i atomowo zapisuje rezerwację. `claimed_at` nadaje PostgreSQL.
-- Testy integracyjne wykazały **jednego zwycięzcę** przy równoczesnym claimie z tym samym `request_id` oraz z różnymi zatwierdzeniami dla tego samego kroku.
-- **Pełna regresja: 1020 passed; Ruff i Mypy: PASSED.**
-- **Status: zweryfikowany technicznie; jeszcze niezatwierdzony i niewypchnięty w Git.**
+- Dodano `ExecutionClaim`, port `claim_once()`, adapter PostgreSQL, tabelę `remediation_execution_claims` i migrację `f4d2a6b8c901`.
+- `UNIQUE(plan_id, step_id)` i `UNIQUE(request_id)` oraz transakcyjna ponowna kontrola zatwierdzenia zapewniają jednokrotną rezerwację w testowanych warunkach współbieżności.
+- **Status Git:** commit `3319a17` wypchnięty na `origin/main`.
+
+### 2026-11-12 — VerifiedExecutionScope i ExecutionClaimService
+
+- Guard zwraca niezmienny `VerifiedExecutionScope`, zachowując wcześniejsze API `validate_for_step()`.
+- `ExecutionClaimService` łączy Guard z `claim_once()` bez ponownego uruchamiania Preflight; odmowy i błędy propaguje zamiast maskować.
+- Pełen przepływ zatwierdzenie → Guard → Claim przetestowano z PostgreSQL. **Status Git:** commit `2ebea2a` wypchnięty na `origin/main`.
+
+### 2026-11-13 — Durable Remediation Execution Lifecycle
+
+- Dodano niezmienny `RemediationExecution` ze stanami `EXECUTING`, `SUCCEEDED`, `FAILED`, `UNKNOWN` oraz port `RemediationExecutionRepository`.
+- Wdrożono tabelę `remediation_executions`, `UNIQUE(claim_id)`, klucz obcy do claimów, ograniczenia `CHECK` i migrację `a31e5d79c204`.
+- `PostgresRemediationExecutionRepository`: `start_once()` (jeden trwały start), `record_outcome_once()` (jednorazowy atomowy wynik) i `get_by_claim_id()` (odczyt bez skutków ubocznych).
+- Testy na rzeczywistym PostgreSQL objęły zapis/odczyt, wszystkie statusy i kontrolowane wyścigi współbieżnych workerów przy starcie oraz zapisie wyniku.
+- **Weryfikacja:** pełna regresja **1109 passed**; Ruff i Mypy: PASSED. **Status Git:** 9 plików nowego komponentu nie zostało jeszcze zatwierdzonych i wypchniętych.
 
 ## 4. Co pozostało do zaprojektowania
 
-- **Najbliżej:** serwis aplikacyjny koordynujący `ApprovalExecutionGuard` i atomowe `claim_once()`; testy integracji oraz zachowania przy błędach i retry.
-- **Przed uruchamianiem MCP:** lifecycle wykonania, trwały status, kontrola niepewnego wyniku, idempotency downstream, zachowanie przy restartach LangGraph i zmianie tożsamości zasobu.
-- **Dalsze prace:** rzeczywiste uwierzytelnianie i produkcyjny RBAC, integracja HITL/LangGraph, adaptery MCP i pozostałe elementy roadmapy z `PROJECT_BRIEF.md`.
+- **Najbliżej:** po commicie/pushu przygotować serwis łączący atomowy Claim z trwałym `start_once()` oraz jasno określić granicę uprawnienia do pojedynczego wywołania narzędzia.
+- **Przed MCP:** bezpieczne wywołanie, polityka błędów i niepewnego rezultatu, downstream idempotency/reconciliation, wznowienia LangGraph, kontrola zmian celu między weryfikacją a działaniem i osobna polityka czasu wykonania.
+- **Dalsze prace:** produkcyjne uwierzytelnianie/RBAC, HITL/LangGraph, serwery i klient MCP, RAG, observability, CI/CD i deployment według `PROJECT_BRIEF.md`.
 
 ## 5. Wznowienie pracy i zasady współpracy
 
-- Przed każdą zmianą istniejącego pliku analizujemy **cały aktualny plik**; nie rekonstruujemy kodu z tego dokumentu.
-- Pracujemy iteracyjnie: mała zmiana → testy odpowiednie dla warstwy → analiza wyniku → dalszy krok. Maksymalnie 8 plików testowych na jedną partię.
-- Testy integracyjne wymagają lokalnej, izolowanej bazy PostgreSQL. Używane polecenie pełnej regresji:
+- Przed zmianą istniejącego pliku analizujemy **cały aktualny plik**; nie odtwarzamy jego zawartości na podstawie tego dokumentu.
+- Pracujemy iteracyjnie: mała zmiana → właściwe testy → analiza wyniku → kolejny krok. Maksymalnie 8 plików testowych w jednej partii.
+- Pełna regresja na lokalnym PostgreSQL:
 
   ```bash
   RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1 \
@@ -83,5 +87,5 @@
   ```
 
 - Kontrole jakości: `uv run ruff check src/ tests/ migrations/versions/`, `uv run ruff format --check src/ tests/ migrations/versions/`, `uv run mypy src/ai_incident_commander/`.
-- `PROJECT_PROGRESS.md` aktualizujemy **wyłącznie przy znaczącym kamieniu milowym**; Git przechowuje zmiany szczegółowe. Każdy wpis rozróżnia: *zaplanowane*, *zaimplementowane*, *zweryfikowane*, *commit/push*.
-- W nowej rozmowie udostępnić `PROJECT_PROGRESS.md` i `PROJECT_BRIEF.md`; przed kolejną implementacją potwierdzić bieżący stan Git oraz kodu.
+- `PROJECT_PROGRESS.md` aktualizujemy **tylko przy kamieniach milowych**; Git dokumentuje szczegóły. Rozróżniamy *zaplanowane*, *zaimplementowane*, *zweryfikowane* oraz *commit/push*.
+- W nowej rozmowie udostępnić `PROJECT_PROGRESS.md` i `PROJECT_BRIEF.md`; przed kolejną implementacją potwierdzić aktualny Git i kod.
