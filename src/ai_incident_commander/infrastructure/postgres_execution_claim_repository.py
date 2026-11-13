@@ -32,6 +32,28 @@ class PostgresExecutionClaimRepository:
     def __init__(self, *, engine: AsyncEngine) -> None:
         self._engine = engine
 
+    async def get_by_request_id(self, *, request_id: UUID) -> ExecutionClaim | None:
+        """Read a committed claim without creating or reauthorizing an attempt."""
+        statement = sa.select(execution_claims_table).where(
+            execution_claims_table.c.request_id == request_id
+        )
+
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(statement)).mappings().one_or_none()
+
+        if row is None:
+            return None
+
+        return ExecutionClaim(
+            claim_id=row["claim_id"],
+            plan_id=row["plan_id"],
+            step_id=row["step_id"],
+            request_id=row["request_id"],
+            action_fingerprint=row["action_fingerprint"],
+            policy_version=row["policy_version"],
+            claimed_at=row["claimed_at"].astimezone(UTC),
+        )
+
     async def claim_once(
         self,
         *,

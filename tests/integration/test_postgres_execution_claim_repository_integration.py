@@ -453,3 +453,150 @@ def test_claim_once_allows_only_one_concurrent_worker(different_approvals: bool)
                 await engine.dispose()
 
     asyncio.run(run_scenario())
+
+
+def test_get_by_request_id_returns_none_for_unknown_request() -> None:
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        engine = create_database_engine(DatabaseConfig.from_environment())
+        try:
+            claims = PostgresExecutionClaimRepository(engine=engine)
+            assert await claims.get_by_request_id(request_id=uuid4()) is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run_scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    (None, RemediationApprovalOutcome.APPROVED, RemediationApprovalOutcome.REJECTED),
+    ids=("pending", "approved-unclaimed", "rejected"),
+)
+def test_get_by_request_id_does_not_create_claim_for_unclaimed_request(
+    outcome: RemediationApprovalOutcome | None,
+) -> None:
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        engine = create_database_engine(DatabaseConfig.from_environment())
+        request = _request(await _database_now(engine), plan_id=uuid4(), step_id=uuid4())
+        try:
+            approvals = PostgresApprovalRepository(engine=engine)
+            claims = PostgresExecutionClaimRepository(engine=engine)
+            await approvals.create_request(request)
+            if outcome is not None:
+                await _seed_decision(approvals, request, await _database_now(engine), outcome)
+
+            assert await claims.get_by_request_id(request_id=request.request_id) is None
+            assert await claims.get_by_request_id(request_id=request.request_id) is None
+            async with engine.connect() as connection:
+                count = await connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(execution_claims_table)
+                    .where(execution_claims_table.c.request_id == request.request_id)
+                )
+            assert count == 0
+        finally:
+            try:
+                await _clean_test_requests(engine, [request.request_id])
+            finally:
+                await engine.dispose()
+
+    asyncio.run(run_scenario())
+
+
+def test_get_by_request_id_reads_committed_claim_without_regranting_rights() -> None:
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        config = DatabaseConfig.from_environment()
+        writer_engine = create_database_engine(config)
+        reader_engine = create_database_engine(config)
+        request = _request(await _database_now(writer_engine), plan_id=uuid4(), step_id=uuid4())
+        try:
+            approvals = PostgresApprovalRepository(engine=writer_engine)
+            writer = PostgresExecutionClaimRepository(engine=writer_engine)
+            reader = PostgresExecutionClaimRepository(engine=reader_engine)
+            await approvals.create_request(request)
+            await _seed_decision(
+                approvals,
+                request,
+                await _database_now(writer_engine),
+                RemediationApprovalOutcome.APPROVED,
+            )
+            created = await writer.claim_once(**_arguments(request))
+
+            loaded = await reader.get_by_request_id(request_id=request.request_id)
+            repeated = await reader.get_by_request_id(request_id=request.request_id)
+            assert isinstance(loaded, ExecutionClaim)
+            assert loaded == created
+            assert repeated == created
+            assert loaded.claimed_at.tzinfo is UTC
+
+            async with reader_engine.connect() as connection:
+                rows = (
+                    (
+                        await connection.execute(
+                            sa.select(execution_claims_table).where(
+                                execution_claims_table.c.request_id == request.request_id
+                            )
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+            assert len(rows) == 1
+            assert rows[0]["claim_id"] == created.claim_id
+            assert rows[0]["claimed_at"] == created.claimed_at
+
+            # A read must not turn an existing claim into a new authorization.
+            with pytest.raises(ExecutionClaimAlreadyExistsError):
+                await writer.claim_once(**_arguments(request))
+        finally:
+            try:
+                await _clean_test_requests(writer_engine, [request.request_id])
+            finally:
+                await reader_engine.dispose()
+                await writer_engine.dispose()
+
+    asyncio.run(run_scenario())
+
+
+def test_get_by_request_id_is_scoped_to_the_requested_approval() -> None:
+    _require_database_tests()
+
+    async def run_scenario() -> None:
+        engine = create_database_engine(DatabaseConfig.from_environment())
+        now = await _database_now(engine)
+        first_request = _request(now, plan_id=uuid4(), step_id=uuid4())
+        second_request = _request(now, plan_id=uuid4(), step_id=uuid4())
+        request_ids = [first_request.request_id, second_request.request_id]
+        try:
+            approvals = PostgresApprovalRepository(engine=engine)
+            claims = PostgresExecutionClaimRepository(engine=engine)
+            for request in (first_request, second_request):
+                await approvals.create_request(request)
+                await _seed_decision(
+                    approvals,
+                    request,
+                    await _database_now(engine),
+                    RemediationApprovalOutcome.APPROVED,
+                )
+
+            first = await claims.claim_once(**_arguments(first_request))
+            assert await claims.get_by_request_id(request_id=first_request.request_id) == first
+            assert await claims.get_by_request_id(request_id=second_request.request_id) is None
+
+            second = await claims.claim_once(**_arguments(second_request))
+            assert first.claim_id != second.claim_id
+            assert await claims.get_by_request_id(request_id=first_request.request_id) == first
+            assert await claims.get_by_request_id(request_id=second_request.request_id) == second
+        finally:
+            try:
+                await _clean_test_requests(engine, request_ids)
+            finally:
+                await engine.dispose()
+
+    asyncio.run(run_scenario())

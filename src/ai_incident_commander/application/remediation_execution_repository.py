@@ -7,6 +7,12 @@ records execution state; it never calls MCP or authorizes a new attempt.
 from typing import Protocol
 from uuid import UUID
 
+from ai_incident_commander.application.approval_execution_guard import (
+    VerifiedExecutionScope,
+)
+from ai_incident_commander.domain.execution_claim_recovery_policy import (
+    ExecutionClaimRecoveryWindowPolicy,
+)
 from ai_incident_commander.domain.remediation_execution import (
     RemediationExecution,
     RemediationExecutionStatus,
@@ -68,4 +74,65 @@ class RemediationExecutionRepository(Protocol):
 
     async def get_by_claim_id(self, *, claim_id: UUID) -> RemediationExecution | None:
         """Read a committed attempt without starting or retrying execution."""
+        ...
+
+
+class RemediationExecutionRecoveryDeniedError(RemediationExecutionRepositoryError):
+    """Base class for expected recovery-specific refusals; never a retry signal."""
+
+
+class RemediationExecutionRecoveryApprovalDeniedError(RemediationExecutionRecoveryDeniedError):
+    """The persisted approval is missing, rejected or inconsistent."""
+
+
+class RemediationExecutionRecoveryScopeMismatchError(RemediationExecutionRecoveryDeniedError):
+    """The freshly verified scope differs from the committed claim or approval."""
+
+
+class RemediationExecutionRecoveryWindowNotSatisfiedError(RemediationExecutionRecoveryDeniedError):
+    """The claim is too old or its timestamp is later than trusted database time."""
+
+
+class RemediationExecutionRecoveryRepository(Protocol):
+    """Specialized, fail-closed persistence port for recovering a committed claim.
+
+    This is intentionally distinct from the standard RemediationExecutionRepository:
+    the normal start_once() path must remain unchanged. Only a trusted recovery
+    service may call this method, after obtaining verified_scope from a fresh
+    ApprovalExecutionGuard.verify_scope_for_step() call. A caller-created scope
+    is not itself proof of authorization.
+
+    An implementation MUST, in one PostgreSQL transaction:
+
+    * lock the committed claim for this claim_id (SELECT ... FOR UPDATE), or
+      raise RemediationExecutionClaimNotFoundError;
+    * verify that the claim and persisted approval request/decision agree on
+      request ID, plan/step IDs, fingerprint and policy version, and that the
+      persisted decision was APPROVED within its decision window;
+    * compare those durable fields with freshly verified_scope;
+    * enforce recovery_policy.max_claim_age using clock_timestamp() from
+      PostgreSQL AFTER acquiring the claim lock and when authorizing INSERT:
+      0 <= database_now - claimed_at < max_claim_age;
+    * refuse if any execution for claim_id already exists, including EXECUTING
+      or a terminal outcome; UNIQUE(claim_id) is the final concurrent safeguard;
+    * commit exactly one EXECUTING attempt before returning the record.
+
+    Deny missing/invalid approval with RecoveryApprovalDeniedError, changed
+    scope with RecoveryScopeMismatchError, time outside the configured window
+    with RecoveryWindowNotSatisfiedError, and prior attempts with the existing
+    RemediationExecutionAlreadyStartedError. Unexpected DB errors propagate.
+
+    This transaction cannot lock an external MCP target. Preflight-to-external
+    action TOCTOU and idempotent external effects require provider-side guards
+    or reconciliation in the future executor. This method never invokes MCP.
+    """
+
+    async def start_recovered_once(
+        self,
+        *,
+        claim_id: UUID,
+        verified_scope: VerifiedExecutionScope,
+        recovery_policy: ExecutionClaimRecoveryWindowPolicy,
+    ) -> RemediationExecution:
+        """Commit a safe recovery start or refuse without creating a second claim."""
         ...

@@ -29,6 +29,14 @@ from ai_incident_commander.application.execution_claim_repository import (
     ExecutionClaimAlreadyExistsError,
 )
 from ai_incident_commander.application.execution_claim_service import ExecutionClaimService
+from ai_incident_commander.application.remediation_execution_recovery_service import (
+    RemediationExecutionRecoveryService,
+)
+from ai_incident_commander.application.remediation_execution_repository import (
+    RemediationExecutionAlreadyStartedError,
+    RemediationExecutionClaimNotFoundError,
+    RemediationExecutionRecoveryWindowNotSatisfiedError,
+)
 from ai_incident_commander.application.remediation_execution_start_service import (
     RemediationExecutionStartService,
 )
@@ -38,6 +46,9 @@ from ai_incident_commander.domain.action_catalog import (
     ActionEffect,
 )
 from ai_incident_commander.domain.execution_claim import ExecutionClaim
+from ai_incident_commander.domain.execution_claim_recovery_policy import (
+    ExecutionClaimRecoveryWindowPolicy,
+)
 from ai_incident_commander.domain.remediation import RemediationRiskLevel, RemediationStep
 from ai_incident_commander.domain.remediation_approval import (
     RemediationApprovalDecision,
@@ -155,6 +166,24 @@ def _make_start_service(case: Scenario) -> RemediationExecutionStartService:
         claim_service=claim_service,
         execution_repository=PostgresRemediationExecutionRepository(engine=case.reader_engine),
     )
+
+
+def _make_recovery_service(case: Scenario) -> RemediationExecutionRecoveryService:
+    return RemediationExecutionRecoveryService(
+        guard=case.guard,
+        claim_repository=PostgresExecutionClaimRepository(engine=case.reader_engine),
+        recovery_repository=PostgresRemediationExecutionRepository(engine=case.reader_engine),
+        recovery_policy=ExecutionClaimRecoveryWindowPolicy(max_claim_age=timedelta(minutes=10)),
+    )
+
+
+async def _seed_approved_claim(case: Scenario) -> ExecutionClaim:
+    """Create a real durable claim, but deliberately do not start execution."""
+    claim_service = ExecutionClaimService(
+        guard=case.guard,
+        repository=PostgresExecutionClaimRepository(engine=case.reader_engine),
+    )
+    return await claim_service.claim_for_step(request_id=case.request_id, step=case.step)
 
 
 async def _count_claims_and_executions(engine: AsyncEngine, request_id: UUID) -> tuple[int, int]:
@@ -575,6 +604,143 @@ def test_start_service_refuses_retry_without_creating_second_execution() -> None
                 (case.step.target, case.step.environment),
                 (case.step.target, case.step.environment),
             ]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            repository = PostgresRemediationExecutionRepository(engine=case.reader_engine)
+            assert await repository.get_by_claim_id(claim_id=first.claim_id) == first
+
+    asyncio.run(run_scenario())
+
+
+def test_recovery_service_commits_existing_approved_claim_without_reclaiming() -> None:
+    """A fresh Guard check precedes a single durable EXECUTING recovery start."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            claim = await _seed_approved_claim(case)
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 0)
+            case.resolver.calls.clear()
+
+            execution = await _make_recovery_service(case).recover_for_step(
+                request_id=case.request_id, step=case.step
+            )
+
+            assert isinstance(execution, RemediationExecution)
+            assert execution.claim_id == claim.claim_id
+            assert execution.status is RemediationExecutionStatus.EXECUTING
+            assert execution.status_changed_at is None
+            assert execution.started_at.utcoffset() == timedelta(0)
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+
+            # Independently read the committed claim and execution after recovery.
+            claim_reader = PostgresExecutionClaimRepository(engine=case.reader_engine)
+            execution_reader = PostgresRemediationExecutionRepository(engine=case.reader_engine)
+            assert await claim_reader.get_by_request_id(request_id=case.request_id) == claim
+            assert await execution_reader.get_by_claim_id(claim_id=claim.claim_id) == execution
+
+    asyncio.run(run_scenario())
+
+
+def test_recovery_service_refuses_missing_claim_before_guard() -> None:
+    """Recovery is not a substitute for creating a new approved claim."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            with pytest.raises(RemediationExecutionClaimNotFoundError):
+                await _make_recovery_service(case).recover_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == []
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+
+    asyncio.run(run_scenario())
+
+
+def test_recovery_service_refuses_resource_drift_and_preserves_claim() -> None:
+    """The trusted Guard must re-resolve the target after the claim is committed."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            claim = await _seed_approved_claim(case)
+            case.resolver.calls.clear()
+            case.resolver.result = replace(
+                case.resolver.result, resource_id="changed-payments-api-resource"
+            )
+
+            with pytest.raises(ApprovalExecutionScopeMismatchError, match="fingerprint"):
+                await _make_recovery_service(case).recover_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 0)
+            claim_reader = PostgresExecutionClaimRepository(engine=case.reader_engine)
+            assert await claim_reader.get_by_request_id(request_id=case.request_id) == claim
+
+    asyncio.run(run_scenario())
+
+
+def test_recovery_service_refuses_expired_claim_after_fresh_guard() -> None:
+    """PostgreSQL time validation still applies after a successful Guard check."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            claim = await _seed_approved_claim(case)
+            case.resolver.calls.clear()
+            async with case.reader_engine.begin() as connection:
+                await connection.execute(
+                    sa.update(execution_claims_table)
+                    .where(execution_claims_table.c.claim_id == claim.claim_id)
+                    .values(claimed_at=sa.func.clock_timestamp() - timedelta(minutes=30))
+                )
+
+            with pytest.raises(RemediationExecutionRecoveryWindowNotSatisfiedError):
+                await _make_recovery_service(case).recover_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 0)
+
+    asyncio.run(run_scenario())
+
+
+def test_recovery_service_rejects_retry_and_preserves_first_execution() -> None:
+    """An existing EXECUTING record never becomes a new execution right."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            claim = await _seed_approved_claim(case)
+            service = _make_recovery_service(case)
+            first = await service.recover_for_step(request_id=case.request_id, step=case.step)
+
+            with pytest.raises(RemediationExecutionAlreadyStartedError):
+                await service.recover_for_step(request_id=case.request_id, step=case.step)
+
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            assert len(case.resolver.calls) == 3  # Claim + fresh Guard per recovery attempt.
+            repository = PostgresRemediationExecutionRepository(engine=case.reader_engine)
+            assert first.claim_id == claim.claim_id
+            assert await repository.get_by_claim_id(claim_id=claim.claim_id) == first
+
+    asyncio.run(run_scenario())
+
+
+def test_recovery_service_refuses_existing_standard_start() -> None:
+    """Recovery cannot bypass an execution already started by the normal path."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            first = await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+
+            with pytest.raises(RemediationExecutionAlreadyStartedError):
+                await _make_recovery_service(case).recover_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
             assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
             repository = PostgresRemediationExecutionRepository(engine=case.reader_engine)
             assert await repository.get_by_claim_id(claim_id=first.claim_id) == first

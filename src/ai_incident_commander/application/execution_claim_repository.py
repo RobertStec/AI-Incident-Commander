@@ -48,6 +48,14 @@ class ExecutionClaimRepository(Protocol):
     race with a changing external target between preflight and MCP execution.
     """
 
+    async def get_by_request_id(self, *, request_id: UUID) -> ExecutionClaim | None:
+        """Read a committed claim, if any, without granting an execution right.
+
+        This is a read-only recovery input. It must not modify or create claims,
+        repeat approval checks, or authorize MCP execution or retry.
+        """
+        ...
+
     async def claim_once(
         self,
         *,

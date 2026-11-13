@@ -8,21 +8,22 @@
 ## 1. Aktualny stan projektu
 
 - **Obszar:** Human-in-the-Loop — kontrola zatwierdzeń, rezerwacji i trwałego stanu wykonania remediation.
-- **Ostatni kamień milowy:** **Durable Remediation Execution Lifecycle** (`1.7.8.11.40`) — model, port, schemat i adapter PostgreSQL zaimplementowane; testy jednostkowe, integracyjne i współbieżności zaliczone; **commit/push tego kamienia milowego oczekują**.
-- **Najnowsza pełna regresja:** **1109 passed** (2026-11-13). Ruff lint/format: PASSED (82 pliki); Mypy: PASSED (42 pliki źródłowe).
-- **Migracje PostgreSQL:** `f4d2a6b8c901` (Execution Claims) oraz `a31e5d79c204` (Execution Lifecycle) zastosowane lokalnie; testy zgodności schematów zaliczone.
-- **Git:** ostatni potwierdzony push `2ebea2a` na `origin/main` (Guard → Atomic Claim). Ostatnia kontrola wykazała **9 nowych, nieśledzonych plików** Execution Lifecycle; nie obejmowała jeszcze tej aktualizacji dokumentu.
-- **Bezpośredni następny krok:** dodać `PROJECT_PROGRESS.md` i 9 plików Execution Lifecycle do staging area, sprawdzić staged diff, wykonać commit/push. Następnie zaprojektować bezpieczną orkiestrację Claim → Execution Lifecycle, nadal bez wywołań MCP.
+- **Ostatni kamień milowy:** **Trusted Crash Recovery** (`1.7.8.11.41.5`) — kontrolowane wznowienie istniejącego claimu *bez* wcześniejszej próby wykonania; świeży Guard, polityka wieku claimu i atomowe `start_recovered_once()` w PostgreSQL. Implementacja i testy zweryfikowane; **commit/push tego etapu jeszcze niepotwierdzone**.
+- **Najnowsza pełna regresja:** **1186 passed** (2026-11-13, lokalny PostgreSQL z testami opt-in). Ruff lint: PASSED, format: **90 plików**; Mypy: PASSED, **45 plików źródłowych**.
+- **Migracje PostgreSQL:** `f4d2a6b8c901` (Execution Claims) oraz `a31e5d79c204` (Execution Lifecycle) zastosowane lokalnie; recovery nie wymagało nowej migracji.
+- **Git:** ostatni potwierdzony commit/push to `63d1ca8` na `origin/main` (standardowe Claim → EXECUTING). **Aktualny working tree i staging nie zostały jeszcze zweryfikowane po pracach recovery**.
+- **Bezpośredni następny krok:** zaktualizować checkpoint `SESSION_HANDOFF.md`, wykonać `git status --short`, `git diff --stat`, `git diff --check`; następnie kontrola staged diff, commit i push zmian Trusted Crash Recovery.
 
 ## 2. Kluczowe decyzje i granice bezpieczeństwa
 
 - **Oddzielne odpowiedzialności:** zaufany Preflight i Action Fingerprint identyfikują operację; Approval Request/Decision rejestrują decyzję człowieka; `ApprovalExecutionGuard` weryfikuje zgodność; `ExecutionClaimRepository` atomowo rezerwuje krok; `RemediationExecutionRepository` utrwala przebieg pojedynczej próby.
 - **Zaufane zatwierdzenie:** decyzja `APPROVED` pochodzi z PostgreSQL (`get_decision()`), nie z klienta, LangGraph ani MCP. `record_decision_once()` chronią transakcja, `SELECT ... FOR UPDATE`, zegar bazy i `UNIQUE(request_id)`.
 - **Powiązanie zakresu:** fingerprint obejmuje krok, parametry, zweryfikowany cel i wersję polityki. Guard ponawia zaufany Preflight. `ExecutionClaimService` przekazuje `VerifiedExecutionScope` bez powtórnego Preflight; repozytorium ponownie weryfikuje zatwierdzenie i zakres w transakcji.
-- **Approval window ≠ execution window:** `requested_at`/`expires_at` opisują okno decyzji, nie odrębny termin wykonania. Polityka ważności wykonania pozostaje do zaprojektowania.
+- **Approval window ≠ recovery window:** `requested_at`/`expires_at` ograniczają moment decyzji operatora, nie termin wykorzystania claimu. Osobna `ExecutionClaimRecoveryWindowPolicy(max_claim_age)` ogranicza **odzyskiwanie** po `claimed_at`; nie ustanawia ogólnej gwarancji wykonania ani prawa do MCP.
 - **Atomic Execution Claim:** `UNIQUE(plan_id, step_id)` oraz `UNIQUE(request_id)` zapobiegają ponownej rezerwacji. `claimed_at` pochodzi z PostgreSQL. Identyczny retry `claim_once()` kończy się odmową.
 - **Execution Claim ≠ Execution Lifecycle:** claim identyfikuje rezerwację; osobny `RemediationExecution` identyfikuje próbę i jej stan: `EXECUTING → SUCCEEDED / FAILED / UNKNOWN`. Jedna próba na `claim_id` (`UNIQUE(claim_id)`).
 - **Trwałość i współbieżność:** `start_once()` zatwierdza `EXECUTING` przed planowanym wywołaniem MCP i odmawia ponownego startu; `record_outcome_once()` zapisuje pierwszy wynik warunkowym `UPDATE` i nie pozwala go nadpisać; `get_by_claim_id()` wyłącznie odczytuje. Czas pochodzi z `clock_timestamp()` PostgreSQL. Obie operacje zapisu przeszły testy konkurujących workerów.
+- **Zaufane recovery:** `get_by_request_id()` jedynie odczytuje claim; `RemediationExecutionRecoveryService` ponownie uruchamia Guard; odrębne `start_recovered_once()` blokuje claim, porównuje utrwalone zatwierdzenie i zakres, sprawdza okno wieku claimu zegarem PostgreSQL i zapisuje najwyżej jedno `EXECUTING`. Współbieżność recovery/recovery i recovery/standard start przetestowana.
 - **Niepewny efekt zewnętrzny:** `EXECUTING` po restarcie nie jest pozwoleniem na retry; `UNKNOWN` wymaga odrębnego reconciliation. `FAILED` nie jest automatycznym dowodem braku skutków ubocznych. **Brak gwarancji exactly-once execution po stronie MCP**; wykonawca MCP, idempotency downstream i uzgadnianie rezultatów nie są jeszcze zaimplementowane.
 - **Composition Root i autoryzacja:** jawne zależności i lifecycle `AsyncEngine` bez uzależniania aplikacji od FastAPI/LangGraph. Brak produkcyjnego uwierzytelniania/RBAC i brak domyślnego autoryzatora `allow-all`.
 
@@ -67,12 +68,20 @@
 - Wdrożono tabelę `remediation_executions`, `UNIQUE(claim_id)`, klucz obcy do claimów, ograniczenia `CHECK` i migrację `a31e5d79c204`.
 - `PostgresRemediationExecutionRepository`: `start_once()` (jeden trwały start), `record_outcome_once()` (jednorazowy atomowy wynik) i `get_by_claim_id()` (odczyt bez skutków ubocznych).
 - Testy na rzeczywistym PostgreSQL objęły zapis/odczyt, wszystkie statusy i kontrolowane wyścigi współbieżnych workerów przy starcie oraz zapisie wyniku.
-- **Weryfikacja:** pełna regresja **1109 passed**; Ruff i Mypy: PASSED. **Status Git:** 9 plików nowego komponentu nie zostało jeszcze zatwierdzonych i wypchniętych.
+- **Weryfikacja kamienia milowego:** pełna regresja **1109 passed**; Ruff i Mypy: PASSED. **Status Git:** commit/push `7b3086d` na `origin/main`.
+
+### 2026-11-13 — Standardowa orkiestracja i Trusted Crash Recovery
+
+- `RemediationExecutionStartService` połączył Guard → atomowy Claim → trwały `EXECUTING` bez wywołań MCP i bez automatycznego retry. **Commit/push:** `63d1ca8`.
+- Dodano odczyt `ExecutionClaimRepository.get_by_request_id()` oraz osobną, konfigurowalną `ExecutionClaimRecoveryWindowPolicy` z granicą `0 <= wiek < max_claim_age`.
+- `RemediationExecutionRecoveryService` przy istniejącym claimie uruchamia świeży Guard; osobny `RemediationExecutionRecoveryRepository.start_recovered_once()` atomowo sprawdza utrwalone zatwierdzenie, zgodność zakresu, czas PostgreSQL i brak wcześniejszej próby, po czym zapisuje `EXECUTING`.
+- Testy jednostkowe, integracyjne i kontrolowana współbieżność **recovery vs recovery** oraz **recovery vs standard start** zaliczone. **Pełna regresja: 1186 passed; Ruff/Mypy: PASSED**. **Status Git recovery:** commit/push niepotwierdzone.
+- **Granica:** obejmuje wyłącznie claim bez rozpoczętej próby; nie wznawia `EXECUTING`/`UNKNOWN` i nie rozwiązuje TOCTOU w zewnętrznym systemie MCP.
 
 ## 4. Co pozostało do zaprojektowania
 
-- **Najbliżej:** po commicie/pushu przygotować serwis łączący atomowy Claim z trwałym `start_once()` oraz jasno określić granicę uprawnienia do pojedynczego wywołania narzędzia.
-- **Przed MCP:** bezpieczne wywołanie, polityka błędów i niepewnego rezultatu, downstream idempotency/reconciliation, wznowienia LangGraph, kontrola zmian celu między weryfikacją a działaniem i osobna polityka czasu wykonania.
+- **Najbliżej:** po kontroli Git zatwierdzić i wypchnąć Trusted Crash Recovery. Następnie zaprojektować granicę wykonawcy MCP: zaufany kontekst wykonania, powiązanie z konkretnym zasobem i zachowanie po niepewnym wyniku.
+- **Przed uruchamianiem MCP:** warunkowe operacje na zasobie (tam, gdzie dostawca je wspiera), downstream idempotency/reconciliation, polityka niepewnych rezultatów, wznowienia LangGraph i ograniczenie TOCTOU pomiędzy Preflight a efektem zewnętrznym. Recovery claimu nie rozwiązuje tych zagadnień.
 - **Dalsze prace:** produkcyjne uwierzytelnianie/RBAC, HITL/LangGraph, serwery i klient MCP, RAG, observability, CI/CD i deployment według `PROJECT_BRIEF.md`.
 
 ## 5. Wznowienie pracy i zasady współpracy
@@ -88,4 +97,4 @@
 
 - Kontrole jakości: `uv run ruff check src/ tests/ migrations/versions/`, `uv run ruff format --check src/ tests/ migrations/versions/`, `uv run mypy src/ai_incident_commander/`.
 - `PROJECT_PROGRESS.md` aktualizujemy **tylko przy kamieniach milowych**; Git dokumentuje szczegóły. Rozróżniamy *zaplanowane*, *zaimplementowane*, *zweryfikowane* oraz *commit/push*.
-- W nowej rozmowie udostępnić `PROJECT_PROGRESS.md` i `PROJECT_BRIEF.md`; przed kolejną implementacją potwierdzić aktualny Git i kod.
+- W nowej rozmowie udostępnić `PROJECT_BRIEF.md`, `PROJECT_PROGRESS.md` i najnowszy `SESSION_HANDOFF.md`; przed kolejną implementacją potwierdzić aktualny Git i kod.
