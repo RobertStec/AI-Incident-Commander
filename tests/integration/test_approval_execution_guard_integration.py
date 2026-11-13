@@ -29,6 +29,9 @@ from ai_incident_commander.application.execution_claim_repository import (
     ExecutionClaimAlreadyExistsError,
 )
 from ai_incident_commander.application.execution_claim_service import ExecutionClaimService
+from ai_incident_commander.application.remediation_execution_start_service import (
+    RemediationExecutionStartService,
+)
 from ai_incident_commander.domain.action_catalog import (
     ActionCatalog,
     ActionDefinition,
@@ -40,6 +43,10 @@ from ai_incident_commander.domain.remediation_approval import (
     RemediationApprovalDecision,
     RemediationApprovalOutcome,
     RemediationApprovalRequest,
+)
+from ai_incident_commander.domain.remediation_execution import (
+    RemediationExecution,
+    RemediationExecutionStatus,
 )
 from ai_incident_commander.domain.target_identity import ResolvedTarget
 from ai_incident_commander.infrastructure.approval_tables import (
@@ -54,6 +61,12 @@ from ai_incident_commander.infrastructure.postgres_approval_repository import (
 )
 from ai_incident_commander.infrastructure.postgres_execution_claim_repository import (
     PostgresExecutionClaimRepository,
+)
+from ai_incident_commander.infrastructure.postgres_remediation_execution_repository import (
+    PostgresRemediationExecutionRepository,
+)
+from ai_incident_commander.infrastructure.remediation_execution_tables import (
+    remediation_executions_table,
 )
 from ai_incident_commander.infrastructure.system_clock import SystemClock
 
@@ -106,6 +119,16 @@ class Scenario:
 async def _remove_test_request(engine: AsyncEngine, request_id: UUID) -> None:
     """Remove only this scenario's rows (FK RESTRICT: child before parent)."""
     async with engine.begin() as connection:
+        # FK RESTRICT: execution -> claim -> decision -> request.
+        await connection.execute(
+            sa.delete(remediation_executions_table).where(
+                remediation_executions_table.c.claim_id.in_(
+                    sa.select(execution_claims_table.c.claim_id).where(
+                        execution_claims_table.c.request_id == request_id
+                    )
+                )
+            )
+        )
         await connection.execute(
             sa.delete(execution_claims_table).where(
                 execution_claims_table.c.request_id == request_id
@@ -121,6 +144,40 @@ async def _remove_test_request(engine: AsyncEngine, request_id: UUID) -> None:
                 approval_requests_table.c.request_id == request_id
             )
         )
+
+
+def _make_start_service(case: Scenario) -> RemediationExecutionStartService:
+    claim_service = ExecutionClaimService(
+        guard=case.guard,
+        repository=PostgresExecutionClaimRepository(engine=case.reader_engine),
+    )
+    return RemediationExecutionStartService(
+        claim_service=claim_service,
+        execution_repository=PostgresRemediationExecutionRepository(engine=case.reader_engine),
+    )
+
+
+async def _count_claims_and_executions(engine: AsyncEngine, request_id: UUID) -> tuple[int, int]:
+    """Count only records belonging to this test request."""
+    async with engine.connect() as connection:
+        claim_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(execution_claims_table)
+            .where(execution_claims_table.c.request_id == request_id)
+        )
+        execution_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(
+                remediation_executions_table.join(
+                    execution_claims_table,
+                    remediation_executions_table.c.claim_id == execution_claims_table.c.claim_id,
+                )
+            )
+            .where(execution_claims_table.c.request_id == request_id)
+        )
+    assert claim_count is not None
+    assert execution_count is not None
+    return claim_count, execution_count
 
 
 @asynccontextmanager
@@ -401,5 +458,125 @@ def test_claim_service_rejects_identical_retry_and_preserves_first_claim() -> No
             assert len(rows) == 1
             assert rows[0]["claim_id"] == first_claim.claim_id
             assert rows[0]["claimed_at"] == first_claim.claimed_at
+
+    asyncio.run(run_scenario())
+
+
+def test_start_service_commits_claim_and_durable_executing_after_approval() -> None:
+    """The real guard and both repositories commit the verified execution scope."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            service = _make_start_service(case)
+            execution = await service.start_for_step(request_id=case.request_id, step=case.step)
+
+            assert isinstance(execution, RemediationExecution)
+            assert execution.status is RemediationExecutionStatus.EXECUTING
+            assert execution.status_changed_at is None
+            assert execution.started_at.utcoffset() == timedelta(0)
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+
+            request = await case.reader_repository.get_request(case.request_id)
+            assert request is not None
+            # Independent connection sees both committed transactions.
+            async with case.reader_engine.connect() as connection:
+                persisted_claim = (
+                    (
+                        await connection.execute(
+                            sa.select(execution_claims_table).where(
+                                execution_claims_table.c.request_id == case.request_id
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                persisted_execution = (
+                    (
+                        await connection.execute(
+                            sa.select(remediation_executions_table).where(
+                                remediation_executions_table.c.claim_id == execution.claim_id
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+
+            assert persisted_claim["claim_id"] == execution.claim_id
+            assert persisted_claim["request_id"] == case.request_id
+            assert persisted_claim["plan_id"] == case.step.plan_id
+            assert persisted_claim["step_id"] == case.step.step_id
+            assert persisted_claim["action_fingerprint"] == request.action_fingerprint
+            assert persisted_claim["policy_version"] == request.policy_version
+            assert persisted_execution["execution_id"] == execution.execution_id
+            assert persisted_execution["claim_id"] == execution.claim_id
+            assert persisted_execution["status"] == "executing"
+            assert persisted_execution["started_at"] == execution.started_at
+            assert persisted_execution["status_changed_at"] is None
+
+    asyncio.run(run_scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [None, RemediationApprovalOutcome.REJECTED],
+    ids=("pending", "rejected"),
+)
+def test_start_service_denies_unapproved_without_claim_or_execution(
+    outcome: RemediationApprovalOutcome | None,
+) -> None:
+    """A missing or rejected approval blocks both durable writes."""
+
+    async def run_scenario() -> None:
+        async with _scenario(outcome) as case:
+            service = _make_start_service(case)
+            with pytest.raises(ApprovalExecutionDeniedError):
+                await service.start_for_step(request_id=case.request_id, step=case.step)
+
+            assert case.resolver.calls == []
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+
+    asyncio.run(run_scenario())
+
+
+def test_start_service_denies_resource_drift_without_claim_or_execution() -> None:
+    """Changing the resolved resource blocks the entire start workflow."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            case.resolver.result = replace(
+                case.resolver.result,
+                resource_id="unapproved-payments-api-resource",
+            )
+            service = _make_start_service(case)
+            with pytest.raises(ApprovalExecutionScopeMismatchError, match="fingerprint"):
+                await service.start_for_step(request_id=case.request_id, step=case.step)
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+
+    asyncio.run(run_scenario())
+
+
+def test_start_service_refuses_retry_without_creating_second_execution() -> None:
+    """A repeat cannot reissue a claim or an EXECUTING start."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            service = _make_start_service(case)
+            first = await service.start_for_step(request_id=case.request_id, step=case.step)
+
+            with pytest.raises(ExecutionClaimAlreadyExistsError):
+                await service.start_for_step(request_id=case.request_id, step=case.step)
+
+            assert case.resolver.calls == [
+                (case.step.target, case.step.environment),
+                (case.step.target, case.step.environment),
+            ]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            repository = PostgresRemediationExecutionRepository(engine=case.reader_engine)
+            assert await repository.get_by_claim_id(claim_id=first.claim_id) == first
 
     asyncio.run(run_scenario())
