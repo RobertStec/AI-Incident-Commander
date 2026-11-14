@@ -11,6 +11,7 @@ from ai_incident_commander.application.approval_execution_guard import (
     ApprovalExecutionDeniedError,
     ApprovalExecutionGuard,
     ApprovalExecutionScopeMismatchError,
+    VerifiedExecutionContext,
     VerifiedExecutionScope,
 )
 from ai_incident_commander.application.approval_request_service import (
@@ -304,3 +305,94 @@ def test_verified_scope_is_immutable_and_old_validation_contract_is_preserved() 
     )
     with pytest.raises(FrozenInstanceError):
         verified.action_fingerprint = "afp:v2:" + "f" * 64  # type: ignore[misc]
+
+
+def test_verified_context_binds_target_and_scope_from_single_preflight() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.APPROVED)
+
+    context = asyncio.run(
+        harness.guard.verify_execution_context_for_step(
+            request_id=harness.request.request_id,
+            step=harness.step,
+        )
+    )
+
+    assert isinstance(context, VerifiedExecutionContext)
+    assert isinstance(context.scope, VerifiedExecutionScope)
+    assert context.scope.request_id == harness.request.request_id
+    assert context.scope.plan_id == harness.step.plan_id
+    assert context.scope.step_id == harness.step.step_id
+    assert context.scope.action_fingerprint == harness.request.action_fingerprint
+    assert context.scope.policy_version == harness.request.policy_version
+    assert context.target is harness.resolver.target
+    assert context.target.resource_id == "service-123"
+    assert context.target.source == "test-inventory"
+    assert harness.repository.reads == ["request", "decision"]
+    assert harness.resolver.calls == [("payments-api", "incident-lab")]
+
+
+def test_verified_context_denies_rejected_decision_before_target_lookup() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.REJECTED)
+
+    with pytest.raises(ApprovalExecutionDeniedError, match="not been approved"):
+        asyncio.run(
+            harness.guard.verify_execution_context_for_step(
+                request_id=harness.request.request_id, step=harness.step
+            )
+        )
+
+    assert harness.resolver.calls == []
+
+
+def test_verified_context_denies_resource_drift_without_returning_context() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.APPROVED)
+    harness.resolver.target = replace(harness.resolver.target, resource_id="service-replaced")
+
+    with pytest.raises(ApprovalExecutionScopeMismatchError, match="fingerprint"):
+        asyncio.run(
+            harness.guard.verify_execution_context_for_step(
+                request_id=harness.request.request_id, step=harness.step
+            )
+        )
+
+    assert harness.resolver.calls == [("payments-api", "incident-lab")]
+
+
+def test_verified_context_denies_policy_drift() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.APPROVED)
+    harness.repository.request = replace(harness.request, policy_version="apv:v1:" + "f" * 64)
+
+    with pytest.raises(ApprovalExecutionScopeMismatchError, match="policy version"):
+        asyncio.run(
+            harness.guard.verify_execution_context_for_step(
+                request_id=harness.request.request_id, step=harness.step
+            )
+        )
+
+    assert harness.resolver.calls == [("payments-api", "incident-lab")]
+
+
+def test_verified_context_is_immutable_and_retains_original_resolved_identity() -> None:
+    harness = _make_harness()
+    _decide(harness, RemediationApprovalOutcome.APPROVED)
+
+    context = asyncio.run(
+        harness.guard.verify_execution_context_for_step(
+            request_id=harness.request.request_id, step=harness.step
+        )
+    )
+    original = context.target
+    harness.resolver.target = replace(original, resource_id="service-new")
+
+    assert context.target is original
+    assert context.target.resource_id == "service-123"
+    with pytest.raises(FrozenInstanceError):
+        context.target = harness.resolver.target  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        context.scope = replace(context.scope, request_id=uuid4())  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        context.target.resource_id = "service-new"  # type: ignore[misc]

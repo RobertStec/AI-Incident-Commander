@@ -20,6 +20,7 @@ from ai_incident_commander.domain.approval_decision_rules import (
 )
 from ai_incident_commander.domain.remediation import RemediationStep
 from ai_incident_commander.domain.remediation_approval import RemediationApprovalOutcome
+from ai_incident_commander.domain.target_identity import ResolvedTarget
 
 
 class ApprovalExecutionDeniedError(ValueError):
@@ -44,6 +45,18 @@ class VerifiedExecutionScope:
     policy_version: str
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class VerifiedExecutionContext:
+    """Approved scope and resolved identity from the SAME trusted preflight.
+
+    This is not an MCP authorization, retry permit, or durable dispatch token.
+    A trusted application service must still validate execution eligibility.
+    """
+
+    scope: VerifiedExecutionScope
+    target: ResolvedTarget
+
+
 class ApprovalExecutionGuard:
     """Validate approval eligibility; do not reserve or perform execution."""
 
@@ -65,7 +78,17 @@ class ApprovalExecutionGuard:
     async def verify_scope_for_step(
         self, *, request_id: UUID, step: RemediationStep
     ) -> VerifiedExecutionScope:
-        """Return the freshly verified scope; never accept a caller-provided snapshot."""
+        """Preserve the scope-only API for existing claim/recovery callers."""
+        context = await self.verify_execution_context_for_step(request_id=request_id, step=step)
+        return context.scope
+
+    async def verify_execution_context_for_step(
+        self, *, request_id: UUID, step: RemediationStep
+    ) -> VerifiedExecutionContext:
+        """Verify approval and bind the exact target from ONE trusted preflight.
+
+        This does not authorize MCP execution or any retry after EXECUTING.
+        """
         request = await self._repository.get_request(request_id)
         if request is None:
             raise ApprovalExecutionDeniedError("Approval request does not exist.")
@@ -97,10 +120,13 @@ class ApprovalExecutionGuard:
         if fingerprint != request.action_fingerprint:
             raise ApprovalExecutionScopeMismatchError("Remediation action fingerprint has changed.")
 
-        return VerifiedExecutionScope(
-            request_id=request.request_id,
-            plan_id=step.plan_id,
-            step_id=step.step_id,
-            action_fingerprint=fingerprint,
-            policy_version=request.policy_version,
+        return VerifiedExecutionContext(
+            scope=VerifiedExecutionScope(
+                request_id=request.request_id,
+                plan_id=step.plan_id,
+                step_id=step.step_id,
+                action_fingerprint=fingerprint,
+                policy_version=request.policy_version,
+            ),
+            target=preflight.target,
         )
