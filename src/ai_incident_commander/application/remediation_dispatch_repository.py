@@ -8,6 +8,9 @@ reverify the approved operation and bind it to the resolved target.
 from typing import Protocol
 from uuid import UUID
 
+from ai_incident_commander.application.approval_execution_guard import (
+    VerifiedExecutionScope,
+)
 from ai_incident_commander.domain.remediation_dispatch import RemediationDispatch
 
 
@@ -54,4 +57,55 @@ class RemediationDispatchRepository(Protocol):
 
     async def get_by_execution_id(self, *, execution_id: UUID) -> RemediationDispatch | None:
         """Read a committed reservation; absence returns None, never a retry right."""
+        ...
+
+
+class RemediationDispatchApprovalDeniedError(RemediationDispatchRepositoryError):
+    """The persisted approval is missing, rejected, or inconsistent."""
+
+
+class RemediationDispatchScopeMismatchError(RemediationDispatchRepositoryError):
+    """The execution's persisted claim and approval differ from the verified scope."""
+
+
+class RemediationVerifiedDispatchRepository(Protocol):
+    """Atomically bind a fresh trusted scope to one durable dispatch reservation.
+
+    Only a trusted dispatch service may call reserve_verified_once(), using the
+    scope returned by a fresh ApprovalExecutionGuard verification. The scope
+    is data, NOT a self-authenticating capability.
+
+    In ONE PostgreSQL transaction, the implementation MUST:
+
+    * Lock the execution row; require status EXECUTING.
+    * Follow execution -> claim -> approval request / decision in durable data.
+    * Require an APPROVED decision consistent with its request and its
+      original decision window.
+    * Verify request_id, plan_id, step_id, action_fingerprint and policy_version
+      agree across the persisted claim and approval and verified_scope.
+    * Refuse any existing dispatch, including identical retries.
+    * Insert at most one dispatch (UNIQUE(execution_id)), generate the ID on
+      the persistence side, use the PostgreSQL clock and commit before return.
+    * Propagate unexpected database failures; never retry silently.
+
+    Use the existing NotFound, NotExecuting and AlreadyReserved errors, plus
+    ApprovalDenied or ScopeMismatch for scope-specific refusals.
+
+    The legacy RemediationDispatchRepository.reserve_once(execution_id) only
+    guarantees an unscoped reservation. It MUST NOT be used by the future MCP
+    execution path. Its removal or restriction must be completed before any
+    production MCP dispatch can occur.
+
+    A committed reservation is NOT evidence that MCP was invoked and is never
+    permission to send or resend a request after crash or replay. This port
+    cannot prevent external target changes after a trusted preflight.
+    """
+
+    async def reserve_verified_once(
+        self,
+        *,
+        execution_id: UUID,
+        verified_scope: VerifiedExecutionScope,
+    ) -> RemediationDispatch:
+        """Commit a scope-bound dispatch reservation or refuse without retry."""
         ...

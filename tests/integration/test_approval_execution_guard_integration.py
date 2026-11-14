@@ -29,6 +29,11 @@ from ai_incident_commander.application.execution_claim_repository import (
     ExecutionClaimAlreadyExistsError,
 )
 from ai_incident_commander.application.execution_claim_service import ExecutionClaimService
+from ai_incident_commander.application.remediation_dispatch_repository import (
+    RemediationDispatchAlreadyReservedError,
+    RemediationDispatchExecutionNotExecutingError,
+    RemediationDispatchExecutionNotFoundError,
+)
 from ai_incident_commander.application.remediation_execution_recovery_service import (
     RemediationExecutionRecoveryService,
 )
@@ -39,6 +44,10 @@ from ai_incident_commander.application.remediation_execution_repository import (
 )
 from ai_incident_commander.application.remediation_execution_start_service import (
     RemediationExecutionStartService,
+)
+from ai_incident_commander.application.remediation_trusted_dispatch_service import (
+    RemediationTrustedDispatchService,
+    ReservedVerifiedDispatch,
 )
 from ai_incident_commander.domain.action_catalog import (
     ActionCatalog,
@@ -55,6 +64,7 @@ from ai_incident_commander.domain.remediation_approval import (
     RemediationApprovalOutcome,
     RemediationApprovalRequest,
 )
+from ai_incident_commander.domain.remediation_dispatch import RemediationDispatch
 from ai_incident_commander.domain.remediation_execution import (
     RemediationExecution,
     RemediationExecutionStatus,
@@ -73,8 +83,14 @@ from ai_incident_commander.infrastructure.postgres_approval_repository import (
 from ai_incident_commander.infrastructure.postgres_execution_claim_repository import (
     PostgresExecutionClaimRepository,
 )
+from ai_incident_commander.infrastructure.postgres_remediation_dispatch_repository import (
+    PostgresRemediationDispatchRepository,
+)
 from ai_incident_commander.infrastructure.postgres_remediation_execution_repository import (
     PostgresRemediationExecutionRepository,
+)
+from ai_incident_commander.infrastructure.remediation_dispatch_tables import (
+    remediation_dispatches_table,
 )
 from ai_incident_commander.infrastructure.remediation_execution_tables import (
     remediation_executions_table,
@@ -130,7 +146,18 @@ class Scenario:
 async def _remove_test_request(engine: AsyncEngine, request_id: UUID) -> None:
     """Remove only this scenario's rows (FK RESTRICT: child before parent)."""
     async with engine.begin() as connection:
-        # FK RESTRICT: execution -> claim -> decision -> request.
+        # FK RESTRICT: dispatch -> execution -> claim -> decision -> request.
+        claim_ids = sa.select(execution_claims_table.c.claim_id).where(
+            execution_claims_table.c.request_id == request_id
+        )
+        execution_ids = sa.select(remediation_executions_table.c.execution_id).where(
+            remediation_executions_table.c.claim_id.in_(claim_ids)
+        )
+        await connection.execute(
+            sa.delete(remediation_dispatches_table).where(
+                remediation_dispatches_table.c.execution_id.in_(execution_ids)
+            )
+        )
         await connection.execute(
             sa.delete(remediation_executions_table).where(
                 remediation_executions_table.c.claim_id.in_(
@@ -177,6 +204,15 @@ def _make_recovery_service(case: Scenario) -> RemediationExecutionRecoveryServic
     )
 
 
+def _make_dispatch_service(case: Scenario) -> RemediationTrustedDispatchService:
+    return RemediationTrustedDispatchService(
+        guard=case.guard,
+        claim_repository=PostgresExecutionClaimRepository(engine=case.reader_engine),
+        execution_repository=PostgresRemediationExecutionRepository(engine=case.reader_engine),
+        dispatch_repository=PostgresRemediationDispatchRepository(engine=case.reader_engine),
+    )
+
+
 async def _seed_approved_claim(case: Scenario) -> ExecutionClaim:
     """Create a real durable claim, but deliberately do not start execution."""
     claim_service = ExecutionClaimService(
@@ -207,6 +243,27 @@ async def _count_claims_and_executions(engine: AsyncEngine, request_id: UUID) ->
     assert claim_count is not None
     assert execution_count is not None
     return claim_count, execution_count
+
+
+async def _count_dispatches(engine: AsyncEngine, request_id: UUID) -> int:
+    """Count dispatches for only this request across durable foreign keys."""
+    async with engine.connect() as connection:
+        count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(
+                remediation_dispatches_table.join(
+                    remediation_executions_table,
+                    remediation_dispatches_table.c.execution_id
+                    == remediation_executions_table.c.execution_id,
+                ).join(
+                    execution_claims_table,
+                    remediation_executions_table.c.claim_id == execution_claims_table.c.claim_id,
+                )
+            )
+            .where(execution_claims_table.c.request_id == request_id)
+        )
+    assert isinstance(count, int)
+    return count
 
 
 @asynccontextmanager
@@ -744,5 +801,196 @@ def test_recovery_service_refuses_existing_standard_start() -> None:
             assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
             repository = PostgresRemediationExecutionRepository(engine=case.reader_engine)
             assert await repository.get_by_claim_id(claim_id=first.claim_id) == first
+
+    asyncio.run(run_scenario())
+
+
+def test_trusted_dispatch_service_reserves_matching_approved_execution() -> None:
+    """Real Guard and PostgreSQL bind a single dispatch to the existing execution."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            execution = await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+            case.resolver.calls.clear()
+
+            service = _make_dispatch_service(case)
+            result = await service.reserve_for_step(request_id=case.request_id, step=case.step)
+
+            assert isinstance(result, ReservedVerifiedDispatch)
+            assert isinstance(result.dispatch, RemediationDispatch)
+            assert result.dispatch.execution_id == execution.execution_id
+            assert result.context.scope.request_id == case.request_id
+            assert result.context.scope.plan_id == case.step.plan_id
+            assert result.context.scope.step_id == case.step.step_id
+            assert result.context.target == case.resolver.result
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 1
+
+            repository = PostgresRemediationDispatchRepository(engine=case.reader_engine)
+            assert (
+                await repository.get_by_execution_id(execution_id=execution.execution_id)
+                == result.dispatch
+            )
+
+    asyncio.run(run_scenario())
+
+
+def test_trusted_dispatch_service_refuses_missing_claim_before_guard() -> None:
+    """No claim means no execution lookup can authorize a new dispatch."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            with pytest.raises(RemediationExecutionClaimNotFoundError):
+                await _make_dispatch_service(case).reserve_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == []
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_trusted_dispatch_service_refuses_claim_without_execution() -> None:
+    """An approved claim is not sufficient to dispatch an unstarted attempt."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            claim = await _seed_approved_claim(case)
+            case.resolver.calls.clear()
+
+            with pytest.raises(RemediationDispatchExecutionNotFoundError):
+                await _make_dispatch_service(case).reserve_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert claim.request_id == case.request_id
+            assert case.resolver.calls == []
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 0)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_trusted_dispatch_service_refuses_changed_resource_without_reservation() -> None:
+    """A changed resolved resource fails the fresh Guard check before reservation."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            execution = await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+            case.resolver.calls.clear()
+            case.resolver.result = replace(
+                case.resolver.result, resource_id="replacement-payments-api-resource"
+            )
+
+            with pytest.raises(ApprovalExecutionScopeMismatchError, match="fingerprint"):
+                await _make_dispatch_service(case).reserve_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+            repository = PostgresRemediationDispatchRepository(engine=case.reader_engine)
+            assert await repository.get_by_execution_id(execution_id=execution.execution_id) is None
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+
+    asyncio.run(run_scenario())
+
+
+def test_trusted_dispatch_service_refuses_changed_persisted_approval_before_preflight() -> None:
+    """A tampered persisted decision cannot be bypassed by an existing execution."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+            case.resolver.calls.clear()
+            async with case.reader_engine.begin() as connection:
+                await connection.execute(
+                    sa.update(approval_decisions_table)
+                    .where(approval_decisions_table.c.request_id == case.request_id)
+                    .values(outcome=RemediationApprovalOutcome.REJECTED.value)
+                )
+
+            with pytest.raises(ApprovalExecutionDeniedError, match="not been approved"):
+                await _make_dispatch_service(case).reserve_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == []
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_trusted_dispatch_service_refuses_retry_without_regranting() -> None:
+    """A second Guard check does not make an existing reservation reusable."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            execution = await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+            case.resolver.calls.clear()
+            service = _make_dispatch_service(case)
+            first = await service.reserve_for_step(request_id=case.request_id, step=case.step)
+
+            with pytest.raises(RemediationDispatchAlreadyReservedError):
+                await service.reserve_for_step(request_id=case.request_id, step=case.step)
+
+            assert case.resolver.calls == [
+                (case.step.target, case.step.environment),
+                (case.step.target, case.step.environment),
+            ]
+            repository = PostgresRemediationDispatchRepository(engine=case.reader_engine)
+            assert (
+                await repository.get_by_execution_id(execution_id=execution.execution_id)
+                == first.dispatch
+            )
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 1
+
+    asyncio.run(run_scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    (
+        RemediationExecutionStatus.SUCCEEDED,
+        RemediationExecutionStatus.FAILED,
+        RemediationExecutionStatus.UNKNOWN,
+    ),
+)
+def test_trusted_dispatch_service_refuses_terminal_execution(
+    outcome: RemediationExecutionStatus,
+) -> None:
+    """No terminal or UNKNOWN execution receives a fresh dispatch reservation."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            execution = await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+            await PostgresRemediationExecutionRepository(
+                engine=case.reader_engine
+            ).record_outcome_once(execution_id=execution.execution_id, outcome=outcome)
+            case.resolver.calls.clear()
+
+            with pytest.raises(RemediationDispatchExecutionNotExecutingError):
+                await _make_dispatch_service(case).reserve_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
 
     asyncio.run(run_scenario())

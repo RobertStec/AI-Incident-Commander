@@ -1,59 +1,58 @@
 # AI Incident Commander — Session Handoff
 
-> **Checkpoint:** 2026-11-14, po pełnej regresji **Durable MCP Dispatch Reservation** (`1.7.8.11.42.5`).
+> **Checkpoint:** 2026-11-14, po pełnej regresji **Verified Dispatch Authorization & Trusted Dispatch Service** (`1.7.8.11.42.6`).
 > **Cel:** bezpieczne wznowienie pracy bez odtwarzania długiej historii rozmowy.
-> **Dokumenty:** `PROJECT_BRIEF.md` — wymagania; `PROJECT_PROGRESS.md` — architektura i kamienie milowe.
-> **Priorytet źródeł:** rzeczywiste pliki repozytorium i wyniki wykonanych poleceń > ten checkpoint.
+> **Dokumenty:** `PROJECT_BRIEF.md` — wymagania; `PROJECT_PROGRESS.md` — decyzje architektoniczne i kamienie milowe.
+> **Priorytet źródeł:** rzeczywisty kod i wykonane polecenia > niniejszy checkpoint; stan repozytorium weryfikować w Git.
 
 ## 1. Dokładny punkt wznowienia
 
-- **Bieżący etap:** `1.7.8.11.42.5` — Durable MCP Dispatch Reservation, zakończony technicznie i zweryfikowany; **bieżące zmiany nie mają jeszcze potwierdzonego commita/pushu**.
-- **Pełna regresja:** `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1 uv run --env-file .env pytest -q` → **1225 passed w 19,54 s** (2026-11-14).
-- **Jakość:** Ruff lint PASSED, Ruff format **99 plików**, Mypy **49 plików źródłowych**, bez błędów.
-- **Teraz:** podmienić oba dokumenty w repozytorium, sprawdzić Git, staging, commit i push. **Nie zaczynać wdrażania MCP**, dopóki kamień milowy nie zostanie zamknięty w Git.
-- **Następny etap:** `1.7.8.11.42.6` — Trusted Dispatch Service; najpierw zaprojektować bezpieczny kontrakt wiążący zatwierdzony scope, konkretny target, trwałe EXECUTING i pojedynczy dispatch. Nie dodawać automatycznego ponawiania MCP.
+- **Bieżący etap:** `1.7.8.11.42.6` — Trusted Dispatch Service wraz z transakcyjną Verified Dispatch Authorization, **ukończony technicznie i zweryfikowany**. Commit/push aktualnych zmian: **jeszcze niepotwierdzone**.
+- **Pełna regresja:** `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1 uv run --env-file .env pytest -q` → **1276 passed w 28,77 s** (2026-11-14, lokalny PostgreSQL).
+- **Jakość:** Ruff lint PASSED; Ruff format **102 pliki**; Mypy **50 plików źródłowych**, bez błędów.
+- **Teraz:** zastąpić lokalne `PROJECT_PROGRESS.md` i `SESSION_HANDOFF.md` nowymi wersjami; przejrzeć Git (`status`, `diff`, `diff --check`), dodać tylko uzgodnione pliki, wykonać kontrolę staging, commit, push i `git status -sb`.
+- **Kolejny obszar po commicie:** **Secure MCP Execution Boundary** — najpierw zamknięcie alternatywnej rezerwacji `reserve_once()`, ograniczenie dostępu do adapterów i projekt pojedynczego, niemożliwego do replay wywołania. Jeszcze **bez rzeczywistego MCP**.
 
-## 2. Git, PostgreSQL i testy
+## 2. Git, PostgreSQL i potwierdzone testy
 
-- **Ostatni potwierdzony commit/push:** `1ebfdda` — `feat: implement trusted remediation execution crash recovery`; `main` zsynchronizowana z `origin/main`, clean **bezpośrednio po tym commicie**. Zmiany dispatchu po tym commicie nie są jeszcze zatwierdzone; **aktualnego `git status` nie potwierdzono**.
-- **Alembic:** `f4d2a6b8c901` (Claims) → `a31e5d79c204` (Execution Lifecycle) → **`c4f8a2d7e951` (Dispatch Reservations)**. Lokalny `alembic current`: `c4f8a2d7e951 (head)`; test nowego schematu **1 passed**.
-- **Wybrane testy lokalne:** `tests/unit/test_approval_execution_guard.py` → **18 passed**; `tests/unit/test_remediation_dispatch.py` → **13 passed**; `tests/unit/test_remediation_dispatch_repository.py` → **7 passed**; `tests/integration/test_postgres_remediation_dispatch_repository_integration.py` → **13 passed** (w tym 2 scenariusze współbieżności).
-- Pełna regresja 1225 obejmowała testy opt-in PostgreSQL i zgodności schematów. Nie należy interpretować jej jako dowodu skutków zewnętrznych MCP: wywołania MCP jeszcze nie zaimplementowano.
+- **Ostatni potwierdzony commit/push:** `4aaa1ff` — `feat: implement durable remediation MCP dispatch reservations`; `main` zsynchronizowana z `origin/main`, working tree czysty **bezpośrednio po tym commicie**. Stan bieżącego working tree po pracach `1.7.8.11.42.6` wymaga sprawdzenia.
+- **Alembic:** `f4d2a6b8c901` (Claims) → `a31e5d79c204` (Execution Lifecycle) → `c4f8a2d7e951` (Dispatch Reservations, ostatnia potwierdzona lokalna `head`). Etap Trusted Dispatch Service **nie wprowadza nowej migracji**.
+- **Wybrane testy:** `tests/unit/test_remediation_verified_dispatch_repository.py` → **8 passed**; `tests/unit/test_remediation_trusted_dispatch_service.py` → **15 passed**; `tests/integration/test_postgres_remediation_dispatch_repository_integration.py` → **32 passed** (w tym wyścigi verified reserve/verified reserve i verified reserve/outcome); `tests/integration/test_approval_execution_guard_integration.py` → **29 passed** (w tym 9 nowych scenariuszy serwisu).
+- **Pełna regresja:** **1276 passed** obejmuje testy jednostkowe, integracyjne oraz opt-in PostgreSQL i schematów. Nie testuje faktycznych wywołań zewnętrznych MCP, których jeszcze nie zaimplementowano.
 
-## 3. Zmiany po `1ebfdda` — potwierdzić w `git status`
+## 3. Zmiany po `4aaa1ff` — potwierdzić w `git status`
 
-**Zmodyfikowane (według etapów pracy):**
+**Zmodyfikowane według dotychczasowych etapów:**
 
-- `src/ai_incident_commander/application/approval_execution_guard.py` — `VerifiedExecutionContext` i `verify_execution_context_for_step()`; zachowane starsze API Guard.
-- `tests/unit/test_approval_execution_guard.py` — testy zaufanego scope i `ResolvedTarget` z jednego Preflight.
+- `src/ai_incident_commander/application/remediation_dispatch_repository.py` — port `RemediationVerifiedDispatchRepository`, kontrakt `reserve_verified_once()` i odmowy.
+- `src/ai_incident_commander/infrastructure/postgres_remediation_dispatch_repository.py` — transakcyjny Verified Dispatch; stare `reserve_once()` tymczasowo zachowane.
+- `tests/integration/test_postgres_remediation_dispatch_repository_integration.py` — scenariusze zgodności scope, persisted approval, statusów i współbieżności.
+- `tests/integration/test_approval_execution_guard_integration.py` — pełny przepływ Trusted Dispatch Service na PostgreSQL oraz cleanup `dispatch → execution → claim → decision → request`.
 
-**Dodane (według etapów pracy):**
+**Nowe według dotychczasowych etapów:**
 
-- `src/ai_incident_commander/domain/remediation_dispatch.py` — niezmienny `RemediationDispatch(execution_id, reserved_at, dispatch_id)`.
-- `src/ai_incident_commander/application/remediation_dispatch_repository.py` — port `reserve_once()` / `get_by_execution_id()` i odmowy.
-- `src/ai_incident_commander/infrastructure/remediation_dispatch_tables.py` — tabela `remediation_dispatches`.
-- `migrations/versions/c4f8a2d7e951_create_remediation_dispatches.py` — migracja Alembic.
-- `src/ai_incident_commander/infrastructure/postgres_remediation_dispatch_repository.py` — adapter PostgreSQL.
-- `tests/unit/test_remediation_dispatch.py` i `tests/unit/test_remediation_dispatch_repository.py`.
-- `tests/integration/test_remediation_dispatch_schema_integration.py` i `tests/integration/test_postgres_remediation_dispatch_repository_integration.py`.
-- `PROJECT_PROGRESS.md` i `SESSION_HANDOFF.md` — niniejsza aktualizacja dokumentacji; przed commitem sprawdzić status obu plików.
+- `src/ai_incident_commander/application/remediation_trusted_dispatch_service.py` — `RemediationTrustedDispatchService` i `ReservedVerifiedDispatch`.
+- `tests/unit/test_remediation_verified_dispatch_repository.py` — testy kontraktu.
+- `tests/unit/test_remediation_trusted_dispatch_service.py` — testy serwisu.
 
-## 4. Kluczowe niezmienniki bezpieczeństwa
+**Dokumenty:** `PROJECT_PROGRESS.md` i `SESSION_HANDOFF.md` — aktualizacje tego checkpointu. Nie zakładać, że powyższy wykaz zastępuje rzeczywiste `git status`.
 
-- **Zaufany zakres:** `ApprovalExecutionGuard` weryfikuje persistowane `APPROVED`, aktualny Preflight, Action Fingerprint i wersję polityki. `VerifiedExecutionContext(scope, target)` zwraca scope i konkretny `ResolvedTarget` z **tego samego Preflight**. To nie jest token wykonania.
-- **Trwałe wykonanie:** `ExecutionClaim` rezerwuje krok, `RemediationExecution` utrwala próbę ze stanem `EXECUTING → SUCCEEDED / FAILED / UNKNOWN`. `EXECUTING` i `UNKNOWN` po restarcie **nie pozwalają** automatycznie ponowić efektu zewnętrznego.
-- **Trusted Crash Recovery:** oddzielny serwis może odzyskać tylko istniejący claim **bez rozpoczętego wykonania**, po świeżej weryfikacji Guard i transakcyjnym sprawdzeniu wieku claimu / scope. Został zatwierdzony w commicie `1ebfdda`.
-- **Durable Dispatch Reservation:** `PostgresRemediationDispatchRepository.reserve_once(execution_id)` blokuje wiersz execution (`SELECT ... FOR UPDATE`), wymaga statusu `EXECUTING`, odmawia duplikatu, zapisuje `reserved_at` według zegara PostgreSQL i commituje przed zwróceniem wyniku. `UNIQUE(execution_id)` wymusza maksymalnie jedną rezerwację. Wyścigi reserve/reserve i reserve/outcome przetestowane.
-- **Granica uprawnień:** samo `execution_id`, `VerifiedExecutionContext`, zapis `EXECUTING` lub istniejąca rezerwacja **nie są zgodą na wywołanie MCP**. Port rezerwacji nie weryfikuje fingerprintu, tożsamości zasobu ani autoryzacji wywołującego. Przyszły Trusted Dispatch Service musi stworzyć tę granicę.
-- **Niepewny wynik:** po crashu lub timeout nie wykonywać automatycznego retry; zaplanować idempotency/preconditions u dostawcy oraz reconciliation. PostgreSQL gwarantuje unikalność rezerwacji, nie exactly-once skutku zewnętrznego ani braku TOCTOU po Preflight.
-- **Auth:** brak produkcyjnego RBAC/auth; nigdy nie wprowadzać domyślnego `allow-all`.
+## 4. Architektura i niezmienniki bezpieczeństwa
 
-## 5. Następne polecenia i sposób pracy
+- **Sprawdzony przepływ:** `Persisted Approval → ExecutionClaim → RemediationExecution(EXECUTING) → Fresh ApprovalExecutionGuard → reserve_verified_once() → RemediationDispatch`. Serwis sam wyznacza execution z request ID; klient nie podaje `execution_id` ani `VerifiedExecutionScope`.
+- **Zaufana tożsamość zasobu:** Guard uruchamia świeży Preflight; `VerifiedExecutionContext(scope, target)` zawiera zakres i `ResolvedTarget` z tego samego przebiegu. Fingerprint obejmuje `resource_id`. Kontekst nie jest tokenem uprawniającym do MCP.
+- **Transakcyjna kontrola:** `reserve_verified_once()` blokuje execution (`FOR UPDATE`), wymaga `EXECUTING`, sprawdza execution → claim → persisted Approval Request/Decision, `APPROVED` i okno decyzji, zgodność request/plan/step/fingerprint/policy oraz brak poprzedniej rezerwacji. `UNIQUE(execution_id)` pozostaje ostateczną ochroną; PostgreSQL nadaje czas rezerwacji. Błędy i odmowy nie są automatycznie ponawiane.
+- **Wyścigi zweryfikowane:** verified reserve/verified reserve i verified reserve/outcome — co najwyżej jedna rezerwacja, odmowa po zmianie statusu.
+- **Granica niezamknięta:** starsze `reserve_once(execution_id)` nie sprawdza zatwierdzonego zakresu i nadal istnieje. Przed zbudowaniem MCP Executor trzeba wyeliminować lub odizolować to obejście. Sam `ReservedVerifiedDispatch`, `EXECUTING` ani istniejący rekord dispatchu nie dają prawa do wywołania lub retry MCP.
+- **Brak exactly-once efektu zewnętrznego:** commit rezerwacji przed możliwym wywołaniem nie dowodzi, czy pakiet dotarł do MCP. Po awarii, timeoucie lub utracie odpowiedzi **nie wznawiać automatycznie**. Potrzebne provider-side preconditions, idempotency/reconciliation i obsługa TOCTOU zasobu.
+- **Auth/RBAC:** brak produkcyjnego uwierzytelniania i RBAC; nie dodawać domyślnego `allow-all`. Nie ujawniać portów persystencji dowolnym klientom ani nodom LangGraph jako uprzywilejowanych narzędzi.
 
-1. Po podmianie dokumentów: `git status --short`, `git diff --stat`, `git diff --check` — uwzględnić `??`, których zwykły `git diff --stat` nie wyświetli.
-2. Po sprawdzeniu listy dodać **tylko uzgodnione pliki**, uruchomić `git diff --cached --check`, `git diff --cached --stat`, `git status --short`; następnie commit/push i `git status -sb`.
-3. Rozpocząć projekt Trusted Dispatch Service małymi krokami. **Przed zmianą istniejącego pliku użytkownik przesyła jego całą aktualną wersję**; nie zgadywać implementacji. Maksymalnie 8 plików testowych w partii.
-4. `PROJECT_PROGRESS.md` aktualizować tylko po kamieniach milowych; `SESSION_HANDOFF.md` odświeżać przy większych zmianach lub przed zmianą konwersacji.
+## 5. Co zrobić dalej
+
+1. Na lokalnych plikach: `git status --short`, `git diff --stat`, `git diff --check`. `??` nie są widoczne w zwykłym `git diff --stat`.
+2. Po analizie wyłącznie uzgodnionych plików: `git add <konkretne ścieżki>`, `git diff --cached --check`, `git diff --cached --stat`, `git status --short`; potem commit, push i `git status -sb`.
+3. Dopiero po zamknięciu Git zaprojektować **Secure MCP Execution Boundary**. Zacząć od analizy sposobu usunięcia/izolacji `reserve_once()` oraz tego, gdzie rzeczywisty wywołujący MCP sprawdza uprawnienie do pojedynczego dispatchu. Najpierw kontrakty i testy, bez przedwczesnego klienta MCP.
+4. Przed zmianą istniejącego pliku obejrzeć **cały aktualny plik**. Małe iteracje i maksymalnie **8 plików testowych w partii**. `PROJECT_PROGRESS.md` aktualizować wyłącznie przy ważnych kamieniach milowych; `SESSION_HANDOFF.md` odświeżać przy większych zmianach i przed zmianą rozmowy.
 
 **Powtarzalne kontrole:**
 
