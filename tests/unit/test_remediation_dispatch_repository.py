@@ -1,7 +1,6 @@
-"""Structural contract checks for the remediation dispatch persistence port.
+"""Structural checks for dispatch errors and the read-only repository operation.
 
-These tests do not verify PostgreSQL transactions or concurrency; that requires
-an adapter and real database integration tests in the next implementation step.
+PostgreSQL transaction and concurrency behavior is covered by integration tests.
 """
 
 import inspect
@@ -10,33 +9,23 @@ from uuid import UUID
 
 import pytest
 
+from ai_incident_commander.application import remediation_dispatch_repository as dispatch_module
 from ai_incident_commander.application.remediation_dispatch_repository import (
     RemediationDispatchAlreadyReservedError,
     RemediationDispatchExecutionNotExecutingError,
     RemediationDispatchExecutionNotFoundError,
-    RemediationDispatchRepository,
     RemediationDispatchRepositoryError,
+    RemediationVerifiedDispatchRepository,
 )
 from ai_incident_commander.domain.remediation_dispatch import RemediationDispatch
 
 
-def test_repository_is_a_protocol() -> None:
-    assert RemediationDispatchRepository._is_protocol  # type: ignore[attr-defined]
-
-
-def test_reserve_once_is_async_and_only_accepts_keyword_execution_id() -> None:
-    method = RemediationDispatchRepository.reserve_once
-    assert inspect.iscoroutinefunction(method)
-    signature = inspect.signature(method)
-    assert tuple(signature.parameters) == ("self", "execution_id")
-    assert signature.parameters["execution_id"].kind is inspect.Parameter.KEYWORD_ONLY
-    hints = get_type_hints(method)
-    assert hints["execution_id"] is UUID
-    assert hints["return"] is RemediationDispatch
+def test_unscoped_legacy_repository_port_is_not_exported() -> None:
+    assert not hasattr(dispatch_module, "RemediationDispatchRepository")
 
 
 def test_read_is_async_and_only_accepts_keyword_execution_id() -> None:
-    method = RemediationDispatchRepository.get_by_execution_id
+    method = RemediationVerifiedDispatchRepository.get_by_execution_id
     assert inspect.iscoroutinefunction(method)
     signature = inspect.signature(method)
     assert tuple(signature.parameters) == ("self", "execution_id")

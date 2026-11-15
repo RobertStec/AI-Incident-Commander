@@ -166,12 +166,20 @@ async def _dispatch_count(engine: AsyncEngine, execution_id: UUID) -> int:
     return count
 
 
-def test_reserve_once_commits_one_dispatch_using_postgres_clock() -> None:
+def test_adapter_has_no_unscoped_reservation_entrypoint() -> None:
+    assert not hasattr(PostgresRemediationDispatchRepository, "reserve_once")
+    assert hasattr(PostgresRemediationDispatchRepository, "reserve_verified_once")
+
+
+def test_scope_bound_commits_one_dispatch_using_postgres_clock() -> None:
     async def run_scenario() -> None:
         async with _seed_executions() as (engine, executions):
+            scope = await _scope_for_execution(engine, executions[0])
             repository = PostgresRemediationDispatchRepository(engine=engine)
             before = await _database_now(engine)
-            dispatch = await repository.reserve_once(execution_id=executions[0].execution_id)
+            dispatch = await repository.reserve_verified_once(
+                execution_id=executions[0].execution_id, verified_scope=scope
+            )
             after = await _database_now(engine)
 
             assert isinstance(dispatch, RemediationDispatch)
@@ -200,26 +208,32 @@ def test_reserve_once_commits_one_dispatch_using_postgres_clock() -> None:
     asyncio.run(run_scenario())
 
 
-def test_reserve_once_denies_missing_execution() -> None:
+def test_scope_bound_denies_missing_execution() -> None:
     async def run_scenario() -> None:
-        async with _seed_executions() as (engine, _):
+        async with _seed_executions() as (engine, executions):
+            scope = await _scope_for_execution(engine, executions[0])
             repository = PostgresRemediationDispatchRepository(engine=engine)
             missing = uuid4()
             with pytest.raises(RemediationDispatchExecutionNotFoundError):
-                await repository.reserve_once(execution_id=missing)
+                await repository.reserve_verified_once(execution_id=missing, verified_scope=scope)
             assert await _dispatch_count(engine, missing) == 0
 
     asyncio.run(run_scenario())
 
 
-def test_reserve_once_denies_identical_retry_without_modifying_first() -> None:
+def test_scope_bound_denies_identical_retry_without_modifying_first() -> None:
     async def run_scenario() -> None:
         async with _seed_executions() as (engine, executions):
+            scope = await _scope_for_execution(engine, executions[0])
             execution = executions[0]
             repository = PostgresRemediationDispatchRepository(engine=engine)
-            first = await repository.reserve_once(execution_id=execution.execution_id)
+            first = await repository.reserve_verified_once(
+                execution_id=execution.execution_id, verified_scope=scope
+            )
             with pytest.raises(RemediationDispatchAlreadyReservedError):
-                await repository.reserve_once(execution_id=execution.execution_id)
+                await repository.reserve_verified_once(
+                    execution_id=execution.execution_id, verified_scope=scope
+                )
 
             assert await _dispatch_count(engine, execution.execution_id) == 1
             stored = await repository.get_by_execution_id(execution_id=execution.execution_id)
@@ -228,12 +242,18 @@ def test_reserve_once_denies_identical_retry_without_modifying_first() -> None:
     asyncio.run(run_scenario())
 
 
-def test_reserve_once_keeps_distinct_executions_independent() -> None:
+def test_scope_bound_keeps_distinct_executions_independent() -> None:
     async def run_scenario() -> None:
         async with _seed_executions(count=2) as (engine, executions):
+            first_scope = await _scope_for_execution(engine, executions[0])
+            second_scope = await _scope_for_execution(engine, executions[1])
             repository = PostgresRemediationDispatchRepository(engine=engine)
-            first = await repository.reserve_once(execution_id=executions[0].execution_id)
-            second = await repository.reserve_once(execution_id=executions[1].execution_id)
+            first = await repository.reserve_verified_once(
+                execution_id=executions[0].execution_id, verified_scope=first_scope
+            )
+            second = await repository.reserve_verified_once(
+                execution_id=executions[1].execution_id, verified_scope=second_scope
+            )
 
             assert first.dispatch_id != second.dispatch_id
             assert first.execution_id != second.execution_id
@@ -251,17 +271,20 @@ def test_reserve_once_keeps_distinct_executions_independent() -> None:
         RemediationExecutionStatus.UNKNOWN,
     ),
 )
-def test_reserve_once_refuses_terminal_or_unknown_execution(
+def test_scope_bound_refuses_terminal_or_unknown_execution(
     outcome: RemediationExecutionStatus,
 ) -> None:
     async def run_scenario() -> None:
         async with _seed_executions() as (engine, executions):
+            scope = await _scope_for_execution(engine, executions[0])
             execution_id = executions[0].execution_id
             lifecycle = PostgresRemediationExecutionRepository(engine=engine)
             await lifecycle.record_outcome_once(execution_id=execution_id, outcome=outcome)
             repository = PostgresRemediationDispatchRepository(engine=engine)
             with pytest.raises(RemediationDispatchExecutionNotExecutingError):
-                await repository.reserve_once(execution_id=execution_id)
+                await repository.reserve_verified_once(
+                    execution_id=execution_id, verified_scope=scope
+                )
             assert await _dispatch_count(engine, execution_id) == 0
 
     asyncio.run(run_scenario())
@@ -290,14 +313,19 @@ def test_get_by_execution_id_returns_none_before_reservation() -> None:
 def test_get_by_execution_id_reads_committed_reservation_without_regranting() -> None:
     async def run_scenario() -> None:
         async with _seed_executions() as (engine, executions):
+            scope = await _scope_for_execution(engine, executions[0])
             repository = PostgresRemediationDispatchRepository(engine=engine)
             execution_id = executions[0].execution_id
-            initial = await repository.reserve_once(execution_id=execution_id)
+            initial = await repository.reserve_verified_once(
+                execution_id=execution_id, verified_scope=scope
+            )
 
             assert await repository.get_by_execution_id(execution_id=execution_id) == initial
             assert await repository.get_by_execution_id(execution_id=execution_id) == initial
             with pytest.raises(RemediationDispatchAlreadyReservedError):
-                await repository.reserve_once(execution_id=execution_id)
+                await repository.reserve_verified_once(
+                    execution_id=execution_id, verified_scope=scope
+                )
             assert await _dispatch_count(engine, execution_id) == 1
 
     asyncio.run(run_scenario())
@@ -306,9 +334,12 @@ def test_get_by_execution_id_reads_committed_reservation_without_regranting() ->
 def test_committed_reservation_remains_readable_after_terminal_outcome() -> None:
     async def run_scenario() -> None:
         async with _seed_executions() as (engine, executions):
+            scope = await _scope_for_execution(engine, executions[0])
             execution_id = executions[0].execution_id
             repository = PostgresRemediationDispatchRepository(engine=engine)
-            reserved = await repository.reserve_once(execution_id=execution_id)
+            reserved = await repository.reserve_verified_once(
+                execution_id=execution_id, verified_scope=scope
+            )
             lifecycle = PostgresRemediationExecutionRepository(engine=engine)
             await lifecycle.record_outcome_once(
                 execution_id=execution_id,
@@ -317,7 +348,9 @@ def test_committed_reservation_remains_readable_after_terminal_outcome() -> None
 
             assert await repository.get_by_execution_id(execution_id=execution_id) == reserved
             with pytest.raises(RemediationDispatchExecutionNotExecutingError):
-                await repository.reserve_once(execution_id=execution_id)
+                await repository.reserve_verified_once(
+                    execution_id=execution_id, verified_scope=scope
+                )
             assert await _dispatch_count(engine, execution_id) == 1
 
     asyncio.run(run_scenario())
@@ -328,7 +361,7 @@ async def _compete_while_execution_row_is_locked(
     setup_engine: AsyncEngine,
     execution_id: UUID,
     second_operation: str,
-    verified_scope: VerifiedExecutionScope | None = None,
+    verified_scope: VerifiedExecutionScope,
 ) -> tuple[object, object]:
     """Make two independent workers reach the same locked PostgreSQL row.
 
@@ -380,12 +413,9 @@ async def _compete_while_execution_row_is_locked(
             )
             assert locked_id == execution_id
 
-            if verified_scope is None:
-                first_attempt = first_repository.reserve_once(execution_id=execution_id)
-            else:
-                first_attempt = first_repository.reserve_verified_once(
-                    execution_id=execution_id, verified_scope=verified_scope
-                )
+            first_attempt = first_repository.reserve_verified_once(
+                execution_id=execution_id, verified_scope=verified_scope
+            )
 
             if second_operation == "outcome":
                 second_attempt = PostgresRemediationExecutionRepository(
@@ -394,8 +424,6 @@ async def _compete_while_execution_row_is_locked(
                     execution_id=execution_id,
                     outcome=RemediationExecutionStatus.UNKNOWN,
                 )
-            elif verified_scope is None:
-                second_attempt = second_repository.reserve_once(execution_id=execution_id)
             else:
                 second_attempt = second_repository.reserve_verified_once(
                     execution_id=execution_id, verified_scope=verified_scope
@@ -426,81 +454,6 @@ async def _compete_while_execution_row_is_locked(
             sa.event.remove(engine.sync_engine, "before_cursor_execute", listener)
         for engine in worker_engines:
             await engine.dispose()
-
-
-def test_concurrent_reserve_once_commits_exactly_one_dispatch() -> None:
-    """Two independent workers cannot reserve the same EXECUTING attempt twice."""
-
-    async def run_scenario() -> None:
-        async with _seed_executions() as (engine, executions):
-            execution_id = executions[0].execution_id
-            results = await _compete_while_execution_row_is_locked(
-                setup_engine=engine,
-                execution_id=execution_id,
-                second_operation="reserve",
-            )
-            winners = [result for result in results if isinstance(result, RemediationDispatch)]
-            refusals = [
-                result
-                for result in results
-                if isinstance(result, RemediationDispatchAlreadyReservedError)
-            ]
-            assert len(winners) == 1, results
-            assert len(refusals) == 1, results
-
-            stored = await PostgresRemediationDispatchRepository(engine=engine).get_by_execution_id(
-                execution_id=execution_id
-            )
-            assert stored == winners[0]
-            assert stored is not None
-            assert stored.execution_id == execution_id
-            assert stored.reserved_at.tzinfo is UTC
-            assert await _dispatch_count(engine, execution_id) == 1
-
-    asyncio.run(run_scenario())
-
-
-def test_concurrent_reservation_and_outcome_respect_execution_row_lock() -> None:
-    """An outcome winner denies reservation; a reservation winner persists once."""
-
-    async def run_scenario() -> None:
-        async with _seed_executions() as (engine, executions):
-            execution_id = executions[0].execution_id
-            reservation_result, outcome_result = await _compete_while_execution_row_is_locked(
-                setup_engine=engine,
-                execution_id=execution_id,
-                second_operation="outcome",
-            )
-            assert isinstance(outcome_result, RemediationExecution), (
-                reservation_result,
-                outcome_result,
-            )
-            assert outcome_result.status is RemediationExecutionStatus.UNKNOWN
-            assert outcome_result.execution_id == execution_id
-            persisted_execution = await PostgresRemediationExecutionRepository(
-                engine=engine
-            ).get_by_claim_id(claim_id=executions[0].claim_id)
-            assert persisted_execution == outcome_result
-
-            repository = PostgresRemediationDispatchRepository(engine=engine)
-            stored = await repository.get_by_execution_id(execution_id=execution_id)
-            if isinstance(reservation_result, RemediationDispatch):
-                # Reservation acquired the lock before the conditional outcome UPDATE.
-                assert stored == reservation_result
-                assert await _dispatch_count(engine, execution_id) == 1
-            else:
-                # Outcome acquired the lock first, so reserve_once saw UNKNOWN.
-                assert isinstance(
-                    reservation_result, RemediationDispatchExecutionNotExecutingError
-                ), (reservation_result, outcome_result)
-                assert stored is None
-                assert await _dispatch_count(engine, execution_id) == 0
-
-            # Once the outcome is terminal, neither ordering permits another dispatch.
-            with pytest.raises(RemediationDispatchExecutionNotExecutingError):
-                await repository.reserve_once(execution_id=execution_id)
-
-    asyncio.run(run_scenario())
 
 
 async def _scope_for_execution(

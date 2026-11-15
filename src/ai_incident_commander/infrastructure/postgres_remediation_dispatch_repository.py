@@ -1,7 +1,7 @@
 """PostgreSQL persistence for a single durable remediation dispatch reservation.
 
-This adapter reserves a dispatch *before* a possible MCP call. The verified
-path checks persisted approval and scope; neither path invokes MCP.
+This adapter reserves a dispatch *before* a possible MCP call. It requires a
+verified scope and independently checks persisted approval; it never calls MCP.
 """
 
 from datetime import UTC
@@ -40,79 +40,12 @@ class PostgresRemediationDispatchRepository:
 
     The execution-row lock serializes reservation with lifecycle outcome
     transitions. UNIQUE(execution_id) is a second, database-enforced safeguard.
-    Reading a reservation never permits an MCP call or retry. The legacy
-    reserve_once() is unscoped and must never be exposed to an MCP executor.
+    Reading a reservation never permits an MCP call or retry. Only the verified
+    reservation method may create a dispatch; no unscoped write path exists.
     """
 
     def __init__(self, *, engine: AsyncEngine) -> None:
         self._engine = engine
-
-    async def reserve_once(self, *, execution_id: UUID) -> RemediationDispatch:
-        """Commit one reservation with PostgreSQL time or refuse, without retry."""
-        lock_execution = (
-            sa.select(remediation_executions_table.c.status)
-            .where(remediation_executions_table.c.execution_id == execution_id)
-            .with_for_update()
-        )
-        find_reservation = sa.select(remediation_dispatches_table.c.dispatch_id).where(
-            remediation_dispatches_table.c.execution_id == execution_id
-        )
-        dispatch_id = uuid4()
-        insert_reservation = (
-            sa.insert(remediation_dispatches_table)
-            .values(
-                dispatch_id=dispatch_id,
-                execution_id=execution_id,
-                reserved_at=sa.func.clock_timestamp(),
-            )
-            .returning(remediation_dispatches_table.c.reserved_at)
-        )
-
-        try:
-            async with self._engine.begin() as connection:
-                result = await connection.execute(lock_execution)
-                status = result.scalar_one_or_none()
-                if status is None:
-                    raise RemediationDispatchExecutionNotFoundError(
-                        "Remediation execution does not exist."
-                    )
-                if status != RemediationExecutionStatus.EXECUTING.value:
-                    raise RemediationDispatchExecutionNotExecutingError(
-                        "Remediation execution is no longer EXECUTING."
-                    )
-
-                existing = await connection.execute(find_reservation)
-                if existing.scalar_one_or_none() is not None:
-                    raise RemediationDispatchAlreadyReservedError(
-                        "A dispatch has already been reserved for this execution."
-                    )
-
-                reserved_at = (await connection.execute(insert_reservation)).scalar_one()
-        except IntegrityError as exc:
-            # Convert only the known uniqueness conflict; do not hide FK, PK,
-            # CHECK, or other database errors as an ordinary retry refusal.
-            original = exc.orig
-            diagnostic = getattr(original, "diag", None)
-            constraint_name = (
-                getattr(diagnostic, "constraint_name", None)
-                or getattr(original, "constraint_name", None)
-                or getattr(getattr(original, "__cause__", None), "constraint_name", None)
-            )
-            if (
-                getattr(original, "sqlstate", None) == "23505"
-                and constraint_name == "uq_remediation_dispatches_execution_id"
-            ):
-                raise RemediationDispatchAlreadyReservedError(
-                    "A dispatch has already been reserved for this execution."
-                ) from exc
-            raise
-
-        # Successful return is possible only after the transaction commits.
-        return RemediationDispatch(
-            dispatch_id=dispatch_id,
-            execution_id=execution_id,
-            reserved_at=reserved_at.astimezone(UTC),
-        )
 
     async def reserve_verified_once(
         self,

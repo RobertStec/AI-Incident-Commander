@@ -1,6 +1,6 @@
-"""Structural contract tests for a scope-bound dispatch persistence boundary.
+"""Structural contract tests for the single scope-bound dispatch port.
 
-These tests do not prove the future PostgreSQL adapter's atomic behavior.
+These tests do not prove the PostgreSQL adapter's atomic behavior.
 """
 
 import inspect
@@ -14,7 +14,6 @@ from ai_incident_commander.application.approval_execution_guard import (
 )
 from ai_incident_commander.application.remediation_dispatch_repository import (
     RemediationDispatchApprovalDeniedError,
-    RemediationDispatchRepository,
     RemediationDispatchRepositoryError,
     RemediationDispatchScopeMismatchError,
     RemediationVerifiedDispatchRepository,
@@ -56,13 +55,16 @@ def test_verified_dispatch_refusals_extend_repository_error(
     assert issubclass(error_type, RemediationDispatchRepositoryError)
 
 
-def test_verified_port_has_no_unscoped_reserve_method() -> None:
+def test_verified_port_exposes_only_verified_reservation_and_read() -> None:
+    members = {
+        name
+        for name, value in vars(RemediationVerifiedDispatchRepository).items()
+        if inspect.iscoroutinefunction(value)
+    }
+    assert members == {"reserve_verified_once", "get_by_execution_id"}
     assert "reserve_once" not in vars(RemediationVerifiedDispatchRepository)
-    assert "reserve_verified_once" in vars(RemediationVerifiedDispatchRepository)
 
 
-def test_existing_legacy_port_retains_its_signatures_for_staged_migration() -> None:
-    signature = inspect.signature(RemediationDispatchRepository.reserve_once)
-    assert tuple(signature.parameters) == ("self", "execution_id")
-    assert signature.parameters["execution_id"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert inspect.iscoroutinefunction(RemediationDispatchRepository.get_by_execution_id)
+def test_verified_port_read_returns_optional_remediation_dispatch() -> None:
+    hints = get_type_hints(RemediationVerifiedDispatchRepository.get_by_execution_id)
+    assert hints == {"execution_id": UUID, "return": RemediationDispatch | None}

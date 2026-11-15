@@ -1,8 +1,8 @@
 """Persistence contract for at-most-once reservation of an external dispatch.
 
 Reserving a dispatch is a database fact, NOT permission for an arbitrary caller
-or LangGraph replay to invoke MCP. A separate trusted application boundary must
-reverify the approved operation and bind it to the resolved target.
+or LangGraph replay to invoke MCP. Only a trusted application boundary may
+request a scope-bound reservation; a committed record is not an MCP permit.
 """
 
 from typing import Protocol
@@ -28,36 +28,6 @@ class RemediationDispatchExecutionNotExecutingError(RemediationDispatchRepositor
 
 class RemediationDispatchAlreadyReservedError(RemediationDispatchRepositoryError):
     """A dispatch has already been reserved for this execution_id."""
-
-
-class RemediationDispatchRepository(Protocol):
-    """Reserve at most one dispatch per durable execution, or read its record.
-
-    The future PostgreSQL adapter MUST enforce, in a single transaction:
-
-    * The execution exists and currently has status EXECUTING.
-    * Lock the execution row to serialize concurrent reservations and outcome
-      transitions; UNIQUE(execution_id) is the final database safeguard.
-    * An existing reservation is always refused, including identical retries.
-    * Generate dispatch_id and reserved_at on the persistence side; use the
-      PostgreSQL clock for reserved_at. Commit before returning the record.
-    * Unexpected database errors must propagate without silent retries.
-
-    get_by_execution_id() is strictly read-only. A returned reservation is NOT
-    permission to send or resend an MCP call, including after a worker crash.
-
-    This contract only protects reservation state; it does not verify an action
-    fingerprint, target identity, or caller authorization. A future trusted
-    dispatch service must supply those safeguards before MCP is invoked.
-    """
-
-    async def reserve_once(self, *, execution_id: UUID) -> RemediationDispatch:
-        """Commit one dispatch reservation for an EXECUTING execution or refuse."""
-        ...
-
-    async def get_by_execution_id(self, *, execution_id: UUID) -> RemediationDispatch | None:
-        """Read a committed reservation; absence returns None, never a retry right."""
-        ...
 
 
 class RemediationDispatchApprovalDeniedError(RemediationDispatchRepositoryError):
@@ -91,10 +61,10 @@ class RemediationVerifiedDispatchRepository(Protocol):
     Use the existing NotFound, NotExecuting and AlreadyReserved errors, plus
     ApprovalDenied or ScopeMismatch for scope-specific refusals.
 
-    The legacy RemediationDispatchRepository.reserve_once(execution_id) only
-    guarantees an unscoped reservation. It MUST NOT be used by the future MCP
-    execution path. Its removal or restriction must be completed before any
-    production MCP dispatch can occur.
+    Only the scope-bound reservation is part of this persistence contract.
+    No unscoped reserve_once() entry point may be exposed through this port.
+    The concrete adapter's legacy implementation must be removed separately
+    before production MCP calls are enabled.
 
     A committed reservation is NOT evidence that MCP was invoked and is never
     permission to send or resend a request after crash or replay. This port
@@ -108,4 +78,8 @@ class RemediationVerifiedDispatchRepository(Protocol):
         verified_scope: VerifiedExecutionScope,
     ) -> RemediationDispatch:
         """Commit a scope-bound dispatch reservation or refuse without retry."""
+        ...
+
+    async def get_by_execution_id(self, *, execution_id: UUID) -> RemediationDispatch | None:
+        """Read a committed reservation; never grant a send or retry right."""
         ...
