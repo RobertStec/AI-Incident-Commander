@@ -21,7 +21,7 @@ approval_requests_table = sa.Table(
         name="ck_approval_request_fingerprint",
     ),
     sa.CheckConstraint(
-        "policy_version ~ '^apv:v1:[0-9a-f]{64}$'",
+        "policy_version ~ '^apv:v[12]:[0-9a-f]{64}$'",
         name="ck_approval_request_policy_version",
     ),
     sa.CheckConstraint(

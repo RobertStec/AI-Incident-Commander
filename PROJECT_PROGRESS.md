@@ -2,34 +2,34 @@
 
 > **Cel:** zwięzła pamięć techniczna projektu, umożliwiająca wznowienie pracy w nowej konwersacji.
 > **Dokument nadrzędny:** `PROJECT_BRIEF.md` — wizja, wymagania i roadmapa.
-> **Zasada aktualizacji:** wpisy tylko przy **istotnych kamieniach milowych architektury**, zmianach kluczowych kontraktów lub decyzjach bezpieczeństwa. Nie dokumentujemy osobno każdego testu, drobnej poprawki, etapu pośredniego ani commita.
-> **Źródło szczegółowej historii zmian:** Git i testy w repozytorium. Nie oznaczamy planów jako ukończonej implementacji.
+> **Zasada aktualizacji:** wpisy przy istotnych kamieniach milowych architektury, zmianach kontraktów i decyzjach bezpieczeństwa; historia drobnych zmian należy do Git.
+> **Priorytet dowodów:** aktualne pliki repozytorium i wyniki poleceń > dokument checkpointu. Nie oznaczamy planów jako wdrożonych.
 
 ## 1. Aktualny stan projektu
 
-- **Obszar:** Human-in-the-Loop — kontrola zatwierdzeń, rezerwacji i trwałego stanu wykonania remediation.
-- **Ostatni kamień milowy:** **Verified Dispatch Authorization & Trusted Dispatch Service** (`1.7.8.11.42.6`) — świeży Guard, zaufane powiązanie `request_id → claim → execution`, transakcyjne `reserve_verified_once()` w PostgreSQL i trwała rezerwacja dispatchu. Implementacja i testy zweryfikowane; **commit/push tego kamienia milowego jeszcze niepotwierdzone**.
-- **Najnowsza pełna regresja:** **1276 passed** (2026-11-14, lokalny PostgreSQL z testami opt-in; 28,77 s). Ruff lint: PASSED, format: **102 pliki**; Mypy: PASSED, **50 plików źródłowych**.
-- **Migracje PostgreSQL:** `f4d2a6b8c901` (Execution Claims), `a31e5d79c204` (Execution Lifecycle), `c4f8a2d7e951` (Dispatch Reservations) — zastosowane lokalnie; ostatnia rewizja potwierdzona jako `(head)`, test schematu zaliczony.
-- **Git:** ostatni potwierdzony commit/push `4aaa1ff` (`Durable MCP Dispatch Reservation`) na `origin/main`; po nim working tree był czysty. **Bieżące zmiany Trusted Dispatch Service nie mają jeszcze potwierdzonego commita/pushu; aktualny Git wymaga sprawdzenia**.
-- **Bezpośredni następny krok:** podmienić oba dokumenty, sprawdzić `git status --short`, `git diff --stat` i `git diff --check`; następnie staging tylko uzgodnionych plików, kontrola staged diff, commit i push. Kolejny obszar: Secure MCP Execution Boundary (bez faktycznego dispatchu do czasu zamknięcia luk autoryzacji).
+- **Obszar:** Human-in-the-Loop / durable remediation oraz **MCP Binding Version & Approval Integrity** — przygotowanie zakończone na poziomie kontraktów i testów; prawdziwy executor MCP nadal nie istnieje.
+- **Ostatni kamień milowy:** `1.7.8.11.42.7.5.11` — `SecureMcpExecutor` Protocol i model `McpInvocationResult` (`ACKNOWLEDGED`, `REJECTED`, `UNKNOWN`), bez transportu ani efektów zewnętrznych. Kontrakt: **17 testów passed**.
+- **MCP-bound Composition Root:** `mcp_approval_workflow_lifespan()` wiąże serwis żądań i Guard z tymi samymi zaufanymi `TrustedMcpActionBindings`; **25 testów** (12 istniejących + 13 nowych) zaliczonych.
+- **Ostatnia potwierdzona pełna regresja:** **1400 passed, 0 failed** (2026-11-15; `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1`, PostgreSQL; 29,85 s). Wykonana **przed** dodaniem najnowszych 13 testów MCP Bootstrap i 17 testów kontraktu Executora; pełną regresję trzeba powtórzyć.
+- **Najnowsza kontrola statyczna:** Ruff lint **PASSED**, Ruff format **114 plików**, Mypy **52 pliki źródłowe**, bez błędów (2026-11-15, po dodaniu kontraktu Executora).
+- **PostgreSQL / Alembic:** lokalnie zastosowano `e62b4f0c91ad (head)` — dopuszczono `apv:v1`/`apv:v2` w dwóch ograniczeniach `CHECK`; testy schematu **6 passed**. Nie modyfikowano historycznych migracji.
+- **Git:** ostatni **potwierdzony** commit/push: `7d49058` (`security: remove unverified remediation dispatch reservation`); `main` i `origin/main` były wówczas zsynchronizowane. **Aktualny stan Git po dalszych pracach nie został potwierdzony** — nie zakładać czystego drzewa ani commita zmian `apv:v2`.
+- **Dokumentacja portfolio:** przygotowano `README.md` z widoczną sekcją ewolucji `apv:v1 → apv:v2` oraz `docs/adr/0001-mcp-bound-approval-policy-versioning.md`; ich umieszczenie w bieżącym repo i staging trzeba potwierdzić przez `git status`.
+- **Teraz:** uzupełnić checkpoint `PROJECT_PROGRESS.md` / `SESSION_HANDOFF.md`, ponowić końcową regresję i kontrolę jakości, sprawdzić pełny `git status` (także nowe pliki), następnie uzgodniony staging, commit i push. **Po checkpointcie:** audyt minimum Foundation i wejście w **Phase 2.0 — LangGraph Core**. Nie implementować teraz transportu MCP.
 
 ## 2. Kluczowe decyzje i granice bezpieczeństwa
 
-- **Oddzielne odpowiedzialności:** zaufany Preflight i Action Fingerprint identyfikują operację; Approval Request/Decision rejestrują decyzję człowieka; `ApprovalExecutionGuard` weryfikuje zgodność; `ExecutionClaimRepository` atomowo rezerwuje krok; `RemediationExecutionRepository` utrwala przebieg pojedynczej próby.
-- **Zaufane zatwierdzenie:** decyzja `APPROVED` pochodzi z PostgreSQL (`get_decision()`), nie z klienta, LangGraph ani MCP. `record_decision_once()` chronią transakcja, `SELECT ... FOR UPDATE`, zegar bazy i `UNIQUE(request_id)`.
-- **Powiązanie zakresu:** fingerprint obejmuje krok, parametry, zweryfikowany cel i wersję polityki. Guard ponawia zaufany Preflight. `ExecutionClaimService` przekazuje `VerifiedExecutionScope` bez powtórnego Preflight; repozytorium ponownie weryfikuje zatwierdzenie i zakres w transakcji.
-- **Approval window ≠ recovery window:** `requested_at`/`expires_at` ograniczają moment decyzji operatora, nie termin wykorzystania claimu. Osobna `ExecutionClaimRecoveryWindowPolicy(max_claim_age)` ogranicza **odzyskiwanie** po `claimed_at`; nie ustanawia ogólnej gwarancji wykonania ani prawa do MCP.
-- **Atomic Execution Claim:** `UNIQUE(plan_id, step_id)` oraz `UNIQUE(request_id)` zapobiegają ponownej rezerwacji. `claimed_at` pochodzi z PostgreSQL. Identyczny retry `claim_once()` kończy się odmową.
-- **Execution Claim ≠ Execution Lifecycle:** claim identyfikuje rezerwację; osobny `RemediationExecution` identyfikuje próbę i jej stan: `EXECUTING → SUCCEEDED / FAILED / UNKNOWN`. Jedna próba na `claim_id` (`UNIQUE(claim_id)`).
-- **Trwałość i współbieżność:** `start_once()` zatwierdza `EXECUTING` przed planowanym wywołaniem MCP i odmawia ponownego startu; `record_outcome_once()` zapisuje pierwszy wynik warunkowym `UPDATE` i nie pozwala go nadpisać; `get_by_claim_id()` wyłącznie odczytuje. Czas pochodzi z `clock_timestamp()` PostgreSQL. Obie operacje zapisu przeszły testy konkurujących workerów.
-- **Zaufane recovery:** `get_by_request_id()` jedynie odczytuje claim; `RemediationExecutionRecoveryService` ponownie uruchamia Guard; odrębne `start_recovered_once()` blokuje claim, porównuje utrwalone zatwierdzenie i zakres, sprawdza okno wieku claimu zegarem PostgreSQL i zapisuje najwyżej jedno `EXECUTING`. Współbieżność recovery/recovery i recovery/standard start przetestowana.
-- **Powiązanie z zasobem:** `ApprovalExecutionGuard.verify_execution_context_for_step()` zwraca `VerifiedExecutionContext(scope, target)` z tego samego zaufanego Preflight; starsze API Guard zachowano. `ResolvedTarget.resource_id` uczestniczy w Action Fingerprint. Ten kontekst nie stanowi samodzielnego uprawnienia do MCP.
-- **Durable dispatch reservation:** osobny `RemediationDispatch` i `PostgresRemediationDispatchRepository.reserve_once()` rezerwują co najwyżej jedną próbę dispatchu na wykonanie `EXECUTING`. Transakcja blokuje rekord execution (`FOR UPDATE`), sprawdza status, odmawia duplikatu, nadaje czas z PostgreSQL; `UNIQUE(execution_id)` zabezpiecza bazę. `get_by_execution_id()` tylko odczytuje. Przetestowano wyścigi rezerwacja/rezerwacja i rezerwacja/zapis wyniku.
-- **Verified dispatch authorization:** `reserve_verified_once(execution_id, verified_scope)` w jednej transakcji sprawdza execution → claim → utrwalone Approval Request/Decision, status `EXECUTING`, zgodność `request_id`, planu, kroku, fingerprintu i polityki, poprawne okno zatwierdzenia oraz brak wcześniejszej rezerwacji. Przetestowano wyścigi verified reserve/verified reserve i verified reserve/outcome.
-- **Trusted Dispatch Service:** `RemediationTrustedDispatchService.reserve_for_step(request_id, step)` sam odczytuje claim i execution, uzyskuje świeży `VerifiedExecutionContext` z Guard i wywołuje `reserve_verified_once()`. Nie przyjmuje `execution_id` ani scope od klienta, nie wywołuje MCP i nie ponawia odmów. Zwracany `ReservedVerifiedDispatch` nie jest tokenem do wykonania.
-- **Niepewny efekt zewnętrzny:** `EXECUTING` po restarcie nie jest pozwoleniem na retry; `UNKNOWN` wymaga odrębnego reconciliation. `FAILED` nie jest automatycznym dowodem braku skutków ubocznych. **Brak gwarancji exactly-once execution po stronie MCP**; wykonawca MCP, idempotency downstream i uzgadnianie rezultatów nie są jeszcze zaimplementowane.
-- **Composition Root i autoryzacja:** jawne zależności i lifecycle `AsyncEngine` bez uzależniania aplikacji od FastAPI/LangGraph. Brak produkcyjnego uwierzytelniania/RBAC i brak domyślnego autoryzatora `allow-all`.
+- **Approval i HITL:** decyzja `APPROVED` pochodzi z PostgreSQL, nie od klienta, LLM lub MCP. `record_decision_once()` korzysta z transakcji, `SELECT ... FOR UPDATE`, czasu PostgreSQL i `UNIQUE(request_id)`; produkcyjna autentykacja/RBAC nadal jest do zrobienia.
+- **Identyfikacja zatwierdzonego zakresu:** zaufany Preflight waliduje katalog akcji i aktualną tożsamość zasobu; `afp:v2` obejmuje krok, parametry, `ResolvedTarget` i `policy_version`. Guard tworzy świeży, spójny `VerifiedExecutionContext(scope, target)`.
+- **Polityka `apv:v1` vs `apv:v2`:** `apv:v1` wiąże wyłącznie `ActionCatalog` (historia/legacy), a `apv:v2` także `binding_version` rejestru `TrustedMcpActionBindings` (`action_name → server_id → tool_name`). Zmiana mapowania zmienia wersję i fingerprint; nowe jawne ścieżki MCP fail-closed wobec `apv:v1`/braku bindings.
+- **Kompatybilność:** modele Approval Request i Execution Claim, walidacja fingerprintu i PostgreSQL odczytują/akceptują oba formaty, ale **poprawny historyczny rekord nie jest automatycznie uprawnieniem do mutującego MCP**. Osobne `validate_mcp_bound_remediation_preflight()`, ścieżki serwisów request/Guard i MCP Composition Root wymuszają `apv:v2` dla workflow MCP.
+- **Granica konfiguracji:** `mcp_approval_workflow_lifespan()` wymaga spójnego, niepustego rejestru i podaje tę samą instancję do creation i Guard. Sam Composition Root nie zapobiega ręcznej konstrukcji niespójnych serwisów poza nim; executor musi być osobno ograniczony i uprzywilejowany.
+- **Atomic Execution Claim:** `UNIQUE(plan_id, step_id)` i `UNIQUE(request_id)`, ponowna transakcyjna weryfikacja zatwierdzenia/zakresu, zegar PostgreSQL. Guard / claim nie wywołują MCP.
+- **Execution Lifecycle / recovery:** trwałe `EXECUTING → SUCCEEDED / FAILED / UNKNOWN`, jeden `RemediationExecution` na claim (`UNIQUE(claim_id)`). `RemediationExecutionRecoveryService` może uruchomić wyłącznie istniejący claim, który **nie ma jeszcze execution**, po świeżym Guard i osobnej polityce wieku claimu; nie ponawia `EXECUTING` lub `UNKNOWN`.
+- **Verified Dispatch:** `RemediationTrustedDispatchService` pobiera istniejący claim i execution, ponownie weryfikuje Guard, po czym wywołuje atomowe `reserve_verified_once()` w PostgreSQL. Adapter blokuje execution, sprawdza `EXECUTING`, zgodność scope/claim/approval oraz `UNIQUE(execution_id)`. **Usunięto stare `reserve_once()` i niezabezpieczony port**; `get_by_execution_id()` to odczyt. Istniejący dispatch nie jest uprawnieniem do MCP.
+- **Kontrakt wykonania MCP, bez implementacji:** `SecureMcpExecutor.execute_for_step(request_id, step)` nie bierze od wywołującego `dispatch_id`, `execution_id` ani `VerifiedExecutionScope` jako praw do wykonania. `McpInvocationResult` rozróżnia `ACKNOWLEDGED`, `REJECTED`, `UNKNOWN`; ACK nie oznacza zweryfikowanego usunięcia incydentu.
+- **Granice systemów rozproszonych:** PostgreSQL zapewnia jednorazową **rezerwację**, nie exactly-once efektu zewnętrznego. Po crashu/timeout brak automatycznego retry mutującego MCP; wymagane będą downstream idempotency, preconditions i reconciliation. `server_id` to alias — zmiana endpointu/poświadczeń/semantyki za aliasem nie musi zmieniać `binding_version`; przed prawdziwym MCP potrzebne pinning i integralność konfiguracji.
+- **Brak produkcyjnych efektów MCP:** brak gotowego wykonawcy, klienta/serwerów MCP, gwarantowanego authorization boundary w systemie docelowym, LangGraph durable resume oraz produkcyjnego RBAC/auth. Niczego z tego nie oznaczamy jako ukończone.
 
 ## 3. Kamienie milowe
 
@@ -85,30 +85,44 @@
 ### 2026-11-14 — VerifiedExecutionContext i Durable MCP Dispatch Reservation
 
 - `ApprovalExecutionGuard` udostępnia `verify_execution_context_for_step()` zwracające `VerifiedExecutionContext(scope, target)` z jednego Preflight; istniejące metody `verify_scope_for_step()` i `validate_for_step()` zachowano.
-- Dodano `RemediationDispatch`, port `RemediationDispatchRepository` (`reserve_once()`, `get_by_execution_id()`) oraz adapter `PostgresRemediationDispatchRepository`. Rezerwacja jest zatwierdzana przed potencjalną próbą MCP; identyczny retry kończy się odmową.
+- Dodano `RemediationDispatch`, początkowo z historycznym `reserve_once()`; w kolejnym kamieniu milowym usunięto tę słabszą ścieżkę na rzecz `reserve_verified_once()`. Rezerwacja jest zatwierdzana przed potencjalną próbą MCP; ponowna rezerwacja kończy się odmową.
 - Nowa tabela `remediation_dispatches`: PK `dispatch_id`, FK `execution_id` z `ON DELETE RESTRICT`, `UNIQUE(execution_id)`, `reserved_at` z zegara PostgreSQL. Migracja `c4f8a2d7e951` zastosowana, test schematu zaliczony.
-- Testy PostgreSQL obejmują konkurencję **reserve vs reserve** i **reserve vs outcome**. **Pełna regresja przy zamknięciu etapu: 1225 passed; Ruff/Mypy: PASSED**. **Status Git:** commit/push `4aaa1ff` na `origin/main`.
-- **Granica:** rezerwacja jest trwałym faktem, nie zdarzeniem wysłania ani uprawnieniem do wykonania MCP. Na tym etapie nie istniały jeszcze Trusted Dispatch Service, MCP Executor ani reconciliation.
+- Testy PostgreSQL obejmują konkurencję **reserve vs reserve** i **reserve vs outcome**. **Ówczesna regresja: 1225 passed; Ruff/Mypy: PASSED**. **Późniejszy commit/push:** `4aaa1ff` (`Durable MCP Dispatch Reservations`).
+- **Granica:** rezerwacja jest trwałym faktem, nie zdarzeniem wysłania ani uprawnieniem do wykonania MCP. Trusted Dispatch Service dodano później; nadal brak realnego MCP Executora i reconciliation.
 
-### 2026-11-14 — Verified Dispatch Authorization & Trusted Dispatch Service
+### 2026-11-15 — Trusted Dispatch i usunięcie słabszego API
 
-- Dodano osobny port `RemediationVerifiedDispatchRepository.reserve_verified_once(execution_id, verified_scope)` i jawne odmowy dla braku/niespójności zatwierdzenia i zakresu; stary kontrakt rezerwacji zachowano tymczasowo.
-- `PostgresRemediationDispatchRepository.reserve_verified_once()` transakcyjnie blokuje wykonanie, weryfikuje powiązany claim i utrwalone `APPROVED` w poprawnym oknie czasowym, porównuje cały zatwierdzony zakres i zapisuje jedną rezerwację. Bez nowej migracji.
-- `RemediationTrustedDispatchService` wyszukuje trwały claim i execution z `request_id`, następnie wykonuje świeży Guard (jeden Preflight) i wywołuje zweryfikowaną rezerwację. Zwraca `ReservedVerifiedDispatch` (wynik, **nie** capability), nigdy nie wywołuje MCP.
-- Zweryfikowano odmowy dla podmienionej tożsamości zasobu, niespójnych danych execution/claim/approval, duplikatów i stanów końcowych oraz rzeczywistą współbieżność verified reserve/verified reserve i verified reserve/outcome. **Pełna regresja: 1276 passed; Ruff/Mypy: PASSED.** **Status Git:** bieżący commit/push jeszcze niepotwierdzone.
-- **Granica:** starsze `reserve_once()` nadal istnieje jako alternatywna, niezweryfikowana ścieżka rezerwacji; przed MCP musi zostać wyeliminowana lub odizolowana. Brak wykonawcy MCP, ochrony provider-side TOCTOU i reconciliation.
+- Dodano `RemediationTrustedDispatchService`, `ReservedVerifiedDispatch` oraz rezerwację przez transakcyjne `reserve_verified_once(execution_id, verified_scope)` — atomowe sprawdzenie `EXECUTING`, claimu, zgody i zakresu.
+- Zweryfikowano w PostgreSQL odporność na duplikaty i niezgodny zakres; całkowicie usunięto wcześniejsze `reserve_once()` z publicznych kontraktów i adaptera. **Pełna regresja po usunięciu: 1274 passed; Ruff/Mypy PASSED.**
+- **Commit/push:** `d07f563` (`Trusted Dispatch Authorization`) oraz `7d49058` (`Remove Unverified Dispatch Reservation`) — potwierdzone na `origin/main`.
 
-## 4. Co pozostało do zaprojektowania
+### 2026-11-15 — MCP-bound Policy v2, Approval Integrity i kompatybilna migracja
 
-- **Najbliżej:** po kontroli Git zatwierdzić i wypchnąć **Verified Dispatch Authorization & Trusted Dispatch Service**. Następnie zaprojektować **Secure MCP Execution Boundary**: usunąć/odizolować obejście przez `reserve_once()`, określić nieodtwarzalną granicę wywołania narzędzia i zasady dostępu do adapterów.
-- **Przed uruchamianiem MCP:** kontrola tego, kto może faktycznie wykonać wywołanie po rezerwacji (bez bearer tokenów i replays), provider-side warunki na konkretnym zasobie, downstream idempotency/reconciliation, polityka niepewnych rezultatów, wznowienia LangGraph i ograniczenie TOCTOU pomiędzy Preflight a efektem zewnętrznym. Sam `ReservedVerifiedDispatch` nie rozwiązuje tych zagadnień.
-- **Dalsze prace:** produkcyjne uwierzytelnianie/RBAC, HITL/LangGraph, serwery i klient MCP, RAG, observability, CI/CD i deployment według `PROJECT_BRIEF.md`.
+- Zaimplementowano `TrustedMcpActionBindings` z `binding_version` oraz `create_mcp_bound_action_policy_version()` generujące `apv:v2` na podstawie zaufanego katalogu i mapowań; legacy `apv:v1` zachowano dla historii.
+- Dopuszczono oba formaty w modelach i `action_fingerprint.py` bez zmiany hasha `afp:v2`. Dodano migrację `e62b4f0c91ad` zmieniającą tylko dwa `CHECK` w PostgreSQL; lokalny upgrade i **6 testów schematu** zaliczone.
+- Dodano MCP-bound Preflight, Approval Request Creation oraz świeży Approval Guard; zaufane mapowanie jest sprawdzane podczas tworzenia i ponownej weryfikacji zatwierdzenia. PostgreSQL E2E do `Verified Dispatch`: **37 passed**, w tym odmowy po zmianie `tool_name`, `server_id`, `resource_id` oraz dla historycznego `apv:v1` na ścieżce MCP.
+- Zaktualizowano legacy testy walidacji `apv:v2`. **Pełna regresja na tym etapie: 1400 passed, 0 failed** (z aktywnymi testami PostgreSQL). **Commit/push tej nowej grupy zmian: jeszcze niepotwierdzone**.
+
+### 2026-11-15 — MCP-bound Composition Root, kontrakt Executora i dokumentacja ADR
+
+- Dodano `mcp_approval_workflow_lifespan()` — wspólne bindings dla tworzenia requestów i Guard; **25 testów** w dwóch plikach Bootstrap zaliczonych.
+- Dodano `SecureMcpExecutor` Protocol / `McpInvocationResult` z rezultatami `ACKNOWLEDGED`, `REJECTED`, `UNKNOWN`; **17 testów** zaliczonych. Bez transportu MCP, retry ani realnych efektów.
+- Ostatni Ruff lint / format / Mypy: **PASSED** (114 sformatowanych plików, 52 pliki źródłowe).
+- Przygotowano `README.md` i `docs/adr/0001-mcp-bound-approval-policy-versioning.md`, które **uczciwie** opisują rzeczywistą, niewcześniej zaplanowaną ewolucję `apv:v1 → apv:v2`, powody i koszty migracji oraz ograniczenia. Stan dodania do repo i commit należy potwierdzić.
+
+## 4. Pozostały zakres i punkt rozpoczęcia Phase 2.0
+
+**Przed Phase 2.0:** końcowa pełna regresja po Composition Root i kontrakcie Executora; Ruff/Mypy; potwierdzenie README/ADR i dokumentów checkpointu w repo; kontrola Git, świadomy staging, commit/push; weryfikacja minimalnych elementów Foundation. Nie dopisywać w tym bloku nowego transportu MCP.
+
+**Odłożone do właściwych faz (nie stanowią warunku rozpoczęcia Phase 2):** bezpieczna implementacja MCP Executora i Gateway, autentykacja/pinning MCP server, konfiguracja aliasów i jej wersjonowanie, preconditions zasobu, downstream idempotency, reconciliation `UNKNOWN`, faktyczne narzędzia i klient MCP; LangGraph orchestration/HITL interrupts/checkpointing, RAG, obserwowalność, CI/CD oraz produkcyjny deployment. Brak gwarancji exactly-once poza PostgreSQL.
+
+**Dokumentacja:** w README sekcja „Architecture evolution: `apv:v1` → `apv:v2`” jest widoczna wysoko na stronie; szczegóły w `docs/adr/0001-mcp-bound-approval-policy-versioning.md`. Nie przedstawiać `apv:v1` jako eksperymentu świadomie zaplanowanego od początku.
 
 ## 5. Wznowienie pracy i zasady współpracy
 
-- Przed zmianą istniejącego pliku analizujemy **cały aktualny plik**; nie odtwarzamy jego zawartości na podstawie tego dokumentu.
-- Pracujemy iteracyjnie: mała zmiana → właściwe testy → analiza wyniku → kolejny krok. Maksymalnie 8 plików testowych w jednej partii.
-- Pełna regresja na lokalnym PostgreSQL:
+- Zawsze analizujemy **cały aktualny plik** przed zmianą; nie zakładać, że snapshot checkpointu to kod repozytorium.
+- Iteracyjnie: jedna mała zmiana → testy → analiza wyniku; maksymalnie **8 plików testowych w partii**.
+- Pełna regresja na lokalnym PostgreSQL (Docker uruchomiony):
 
   ```bash
   RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1 \
@@ -116,5 +130,5 @@
   ```
 
 - Kontrole jakości: `uv run ruff check src/ tests/ migrations/versions/`, `uv run ruff format --check src/ tests/ migrations/versions/`, `uv run mypy src/ai_incident_commander/`.
-- `PROJECT_PROGRESS.md` aktualizujemy **tylko przy kamieniach milowych**; Git dokumentuje szczegóły. Rozróżniamy *zaplanowane*, *zaimplementowane*, *zweryfikowane* oraz *commit/push*.
-- W nowej rozmowie udostępnić `PROJECT_BRIEF.md`, `PROJECT_PROGRESS.md` i najnowszy `SESSION_HANDOFF.md`; przed kolejną implementacją potwierdzić aktualny Git i kod.
+- Git: `git status --short` i `git diff --stat` **nie obejmują** rozmiaru untracked; staged diff sprawdzamy przez `git diff --cached --check` / `--stat`.
+- `PROJECT_PROGRESS.md` aktualizujemy przy kamieniach milowych; `SESSION_HANDOFF.md` odświeżamy przy zamknięciu etapu lub przed nową konwersacją. Oddzielać implementację, testy, repozytorium Git i produkcyjne uruchomienie.

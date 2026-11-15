@@ -29,7 +29,7 @@ execution_claims_table = sa.Table(
         name="ck_execution_claims_fingerprint",
     ),
     sa.CheckConstraint(
-        "policy_version ~ '^apv:v1:[0-9a-f]{64}$'",
+        "policy_version ~ '^apv:v[12]:[0-9a-f]{64}$'",
         name="ck_execution_claims_policy_version",
     ),
 )

@@ -513,6 +513,39 @@ def test_fingerprint_changes_when_unrelated_catalog_action_changes() -> None:
     )
 
 
+@pytest.mark.parametrize("policy_prefix", ("apv:v1:", "apv:v2:"))
+def test_fingerprint_accepts_supported_policy_versions(policy_prefix: str) -> None:
+    step = _make_step()
+    preflight = replace(
+        _make_preflight(step=step),
+        policy_version=policy_prefix + "a" * 64,
+    )
+
+    fingerprint = create_action_fingerprint(step, preflight)
+    assert fullmatch(r"afp:v2:[0-9a-f]{64}", fingerprint) is not None
+
+
+def test_fingerprint_changes_when_policy_version_moves_from_v1_to_v2() -> None:
+    step = _make_step()
+    original = _make_preflight(step=step)
+    assert original.policy_version is not None
+    newer = replace(
+        original,
+        policy_version=original.policy_version.replace("apv:v1:", "apv:v2:", 1),
+    )
+
+    assert create_action_fingerprint(step, newer) != create_action_fingerprint(step, original)
+
+
+def test_fingerprint_changes_when_mcp_bound_policy_digest_changes() -> None:
+    step = _make_step()
+    original = _make_preflight(step=step)
+    binding_a = replace(original, policy_version="apv:v2:" + "a" * 64)
+    binding_b = replace(original, policy_version="apv:v2:" + "b" * 64)
+
+    assert create_action_fingerprint(step, binding_a) != create_action_fingerprint(step, binding_b)
+
+
 @pytest.mark.parametrize(
     "invalid_policy_version",
     [
@@ -522,7 +555,12 @@ def test_fingerprint_changes_when_unrelated_catalog_action_changes() -> None:
         "apv:v1:" + "0" * 63,
         "apv:v1:" + "z" * 64,
         "apv:v1:" + "A" * 64,
-        "apv:v2:" + "0" * 64,
+        "apv:v2:",
+        "apv:v2:" + "0" * 63,
+        "apv:v2:" + "z" * 64,
+        "apv:v2:" + "A" * 64,
+        "apv:v3:" + "0" * 64,
+        "apv:v2:" + "0" * 64 + ":extra",
         "afp:v2:" + "0" * 64,
     ],
 )

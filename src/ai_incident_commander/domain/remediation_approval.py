@@ -43,7 +43,7 @@ class RemediationApprovalRequest:
         if (
             type(self.policy_version) is not str
             or fullmatch(
-                r"apv:v1:[0-9a-f]{64}",
+                r"apv:v[12]:[0-9a-f]{64}",
                 self.policy_version,
             )
             is None

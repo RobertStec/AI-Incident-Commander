@@ -7,8 +7,10 @@ from ai_incident_commander.domain.action_catalog import (
     ActionCatalog,
     ActionParameterDefinition,
 )
+from ai_incident_commander.domain.mcp_action_binding import TrustedMcpActionBindings
 
 _POLICY_VERSION_DOMAIN = b"ai-incident-commander:action-policy:v1\x00"
+_MCP_BOUND_POLICY_VERSION_DOMAIN = b"ai-incident-commander:action-policy:mcp-bound:v2\x00"
 
 
 def _serialize_allowed_values(
@@ -73,3 +75,39 @@ def create_action_policy_version(catalog: ActionCatalog) -> str:
     digest = sha256(_POLICY_VERSION_DOMAIN + canonical_bytes).hexdigest()
 
     return f"apv:v1:{digest}"
+
+
+def create_mcp_bound_action_policy_version(
+    *,
+    catalog: ActionCatalog,
+    bindings: TrustedMcpActionBindings,
+) -> str:
+    """Version the catalog AND its trusted MCP routing as one approval policy.
+
+    Deliberately separate from legacy apv:v1: existing approvals are NOT
+    silently reinterpreted as authorizing newly configured MCP tools.
+    Callers must supply trusted bindings explicitly; no unbound fallback.
+
+    This prepares an apv:v2 value. Approval preflight, domain validators and
+    PostgreSQL constraints do NOT support apv:v2 yet, so do not use it in the
+    active approval/dispatch path until those changes are completed.
+    """
+    if not isinstance(bindings, TrustedMcpActionBindings):
+        raise TypeError("MCP-bound policy requires trusted MCP action bindings.")
+    if bindings.catalog != catalog:
+        raise ValueError("MCP action bindings were built for a different action catalog.")
+
+    payload = {
+        "version": 2,
+        "action_policy_version": create_action_policy_version(catalog),
+        "mcp_binding_version": bindings.binding_version,
+    }
+    canonical_bytes = dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = sha256(_MCP_BOUND_POLICY_VERSION_DOMAIN + canonical_bytes).hexdigest()
+    return f"apv:v2:{digest}"

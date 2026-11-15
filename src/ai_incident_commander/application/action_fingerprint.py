@@ -70,7 +70,7 @@ def create_action_fingerprint(
 
     if (
         not isinstance(policy_version, str)
-        or fullmatch(r"apv:v1:[0-9a-f]{64}", policy_version) is None
+        or fullmatch(r"apv:v[12]:[0-9a-f]{64}", policy_version) is None
     ):
         raise ActionFingerprintInputMismatchError(
             "Remediation preflight result has no valid trusted policy version."

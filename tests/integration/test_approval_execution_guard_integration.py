@@ -58,6 +58,10 @@ from ai_incident_commander.domain.execution_claim import ExecutionClaim
 from ai_incident_commander.domain.execution_claim_recovery_policy import (
     ExecutionClaimRecoveryWindowPolicy,
 )
+from ai_incident_commander.domain.mcp_action_binding import (
+    TrustedMcpActionBindings,
+    TrustedMcpToolBinding,
+)
 from ai_incident_commander.domain.remediation import RemediationRiskLevel, RemediationStep
 from ai_incident_commander.domain.remediation_approval import (
     RemediationApprovalDecision,
@@ -141,6 +145,8 @@ class Scenario:
     reader_repository: PostgresApprovalRepository
     decision: RemediationApprovalDecision | None
     reader_engine: AsyncEngine
+    catalog: ActionCatalog
+    mcp_bindings: TrustedMcpActionBindings | None
 
 
 async def _remove_test_request(engine: AsyncEngine, request_id: UUID) -> None:
@@ -266,9 +272,25 @@ async def _count_dispatches(engine: AsyncEngine, request_id: UUID) -> int:
     return count
 
 
+def _trusted_mcp_bindings(catalog: ActionCatalog) -> TrustedMcpActionBindings:
+    """Test-owned allowlist: never derive the tool from caller-controlled step data."""
+    return TrustedMcpActionBindings(
+        catalog=catalog,
+        bindings=(
+            TrustedMcpToolBinding(
+                action_name="restart_service",
+                server_id="deployment-mcp",
+                tool_name="restart_service",
+            ),
+        ),
+    )
+
+
 @asynccontextmanager
 async def _scenario(
     outcome: RemediationApprovalOutcome | None,
+    *,
+    mcp_bound: bool = False,
 ) -> AsyncIterator[Scenario]:
     """Create a request/decision using one engine and check using another."""
     config = DatabaseConfig.from_environment()
@@ -306,14 +328,20 @@ async def _scenario(
                 source="integration-test-inventory",
             )
         )
+        mcp_bindings = _trusted_mcp_bindings(catalog) if mcp_bound else None
         creator = ApprovalRequestCreationService(
             repository=writer_repository,
             clock=SystemClock(),
             catalog=catalog,
             resolver=resolver,
             validity_period=timedelta(minutes=30),
+            mcp_bindings=mcp_bindings,
         )
-        request = await creator.create_for_step(step)
+        request = (
+            await creator.create_mcp_bound_for_step(step)
+            if mcp_bound
+            else await creator.create_for_step(step)
+        )
         request_id = request.request_id
 
         decision: RemediationApprovalDecision | None = None
@@ -336,9 +364,18 @@ async def _scenario(
             repository=reader_repository,
             catalog=catalog,
             resolver=resolver,
+            mcp_bindings=mcp_bindings,
         )
         yield Scenario(
-            request_id, step, guard, resolver, reader_repository, decision, reader_engine
+            request_id=request_id,
+            step=step,
+            guard=guard,
+            resolver=resolver,
+            reader_repository=reader_repository,
+            decision=decision,
+            reader_engine=reader_engine,
+            catalog=catalog,
+            mcp_bindings=mcp_bindings,
         )
     finally:
         try:
@@ -992,5 +1029,215 @@ def test_trusted_dispatch_service_refuses_terminal_execution(
             assert case.resolver.calls == [(case.step.target, case.step.environment)]
             assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
             assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+# MCP-bound approval integrity: all tests use real PostgreSQL, independent engines,
+# and the same FK-safe cleanup as the legacy scenarios above. No MCP tool is invoked.
+
+
+def test_mcp_bound_guard_accepts_persisted_v2_approval() -> None:
+    """The writer's apv:v2 request is independently verified by the reader Guard."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED, mcp_bound=True) as case:
+            request = await case.reader_repository.get_request(case.request_id)
+            assert request is not None
+            assert request.policy_version.startswith("apv:v2:")
+            assert case.decision is not None
+            assert await case.reader_repository.get_decision(case.request_id) == case.decision
+
+            context = await case.guard.verify_mcp_execution_context_for_step(
+                request_id=case.request_id, step=case.step
+            )
+
+            assert context.scope.request_id == request.request_id
+            assert context.scope.policy_version == request.policy_version
+            assert context.scope.action_fingerprint == request.action_fingerprint
+            assert context.target == case.resolver.result
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("tool_name", "force_restart_service"),
+        ("server_id", "alternate-deployment-mcp"),
+    ],
+)
+def test_mcp_bound_guard_denies_changed_tool_mapping(
+    changed_field: str, changed_value: str
+) -> None:
+    """A deployment binding change invalidates even a committed approval."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED, mcp_bound=True) as case:
+            assert case.mcp_bindings is not None
+            original_binding = case.mcp_bindings.bindings[0]
+            if changed_field == "tool_name":
+                changed_binding = replace(original_binding, tool_name=changed_value)
+            else:
+                changed_binding = replace(original_binding, server_id=changed_value)
+            changed_bindings = TrustedMcpActionBindings(
+                catalog=case.catalog, bindings=(changed_binding,)
+            )
+            assert changed_bindings.binding_version != case.mcp_bindings.binding_version
+            guard = ApprovalExecutionGuard(
+                repository=case.reader_repository,
+                catalog=case.catalog,
+                resolver=case.resolver,
+                mcp_bindings=changed_bindings,
+            )
+
+            with pytest.raises(ApprovalExecutionScopeMismatchError, match="policy version"):
+                await guard.verify_mcp_execution_context_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_mcp_bound_guard_denies_legacy_v1_approval_before_target_resolution() -> None:
+    """Historic approvals are readable but cannot pass the MCP-bound Guard."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED) as case:
+            request = await case.reader_repository.get_request(case.request_id)
+            assert request is not None
+            assert request.policy_version.startswith("apv:v1:")
+            guard = ApprovalExecutionGuard(
+                repository=case.reader_repository,
+                catalog=case.catalog,
+                resolver=case.resolver,
+                mcp_bindings=_trusted_mcp_bindings(case.catalog),
+            )
+
+            with pytest.raises(ApprovalExecutionScopeMismatchError, match="apv:v2"):
+                await guard.verify_mcp_execution_context_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == []
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_mcp_bound_guard_denies_resource_identity_drift() -> None:
+    """Binding equality does not compensate for changed authoritative resource ID."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED, mcp_bound=True) as case:
+            case.resolver.result = replace(
+                case.resolver.result, resource_id="unexpected-service-resource"
+            )
+
+            with pytest.raises(ApprovalExecutionScopeMismatchError, match="fingerprint"):
+                await case.guard.verify_mcp_execution_context_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_mcp_bound_guard_denies_rejected_decision_before_preflight() -> None:
+    """Rejected operator decision is checked before any fresh inventory lookup."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.REJECTED, mcp_bound=True) as case:
+            with pytest.raises(ApprovalExecutionDeniedError, match="not been approved"):
+                await case.guard.verify_mcp_execution_context_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == []
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (0, 0)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+
+    asyncio.run(run_scenario())
+
+
+def test_mcp_bound_dispatch_reserves_v2_approved_execution_once() -> None:
+    """Real claim, execution and dispatch repositories preserve MCP-bound scope."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED, mcp_bound=True) as case:
+            request = await case.reader_repository.get_request(case.request_id)
+            assert request is not None
+            assert request.policy_version.startswith("apv:v2:")
+
+            execution = await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+            claim = await PostgresExecutionClaimRepository(
+                engine=case.reader_engine
+            ).get_by_request_id(request_id=case.request_id)
+            assert claim is not None
+            assert claim.policy_version == request.policy_version
+            assert claim.action_fingerprint == request.action_fingerprint
+            case.resolver.calls.clear()
+
+            reserved = await _make_dispatch_service(case).reserve_for_step(
+                request_id=case.request_id, step=case.step
+            )
+
+            assert reserved.dispatch.execution_id == execution.execution_id
+            assert reserved.context.scope.policy_version == request.policy_version
+            assert reserved.context.scope.action_fingerprint == request.action_fingerprint
+            assert reserved.context.target == case.resolver.result
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 1
+
+    asyncio.run(run_scenario())
+
+
+def test_mcp_binding_drift_after_execution_prevents_dispatch() -> None:
+    """A committed EXECUTING row cannot bypass a fresh Guard after mapping drift."""
+
+    async def run_scenario() -> None:
+        async with _scenario(RemediationApprovalOutcome.APPROVED, mcp_bound=True) as case:
+            execution = await _make_start_service(case).start_for_step(
+                request_id=case.request_id, step=case.step
+            )
+            assert case.mcp_bindings is not None
+            case.resolver.calls.clear()
+            changed = replace(case.mcp_bindings.bindings[0], tool_name="force_restart_service")
+            changed_bindings = TrustedMcpActionBindings(catalog=case.catalog, bindings=(changed,))
+            case.guard = ApprovalExecutionGuard(
+                repository=case.reader_repository,
+                catalog=case.catalog,
+                resolver=case.resolver,
+                mcp_bindings=changed_bindings,
+            )
+
+            with pytest.raises(ApprovalExecutionScopeMismatchError, match="policy version"):
+                await _make_dispatch_service(case).reserve_for_step(
+                    request_id=case.request_id, step=case.step
+                )
+
+            assert case.resolver.calls == [(case.step.target, case.step.environment)]
+            assert await _count_claims_and_executions(case.reader_engine, case.request_id) == (1, 1)
+            assert await _count_dispatches(case.reader_engine, case.request_id) == 0
+            assert (
+                await PostgresRemediationDispatchRepository(
+                    engine=case.reader_engine
+                ).get_by_execution_id(execution_id=execution.execution_id)
+                is None
+            )
 
     asyncio.run(run_scenario())

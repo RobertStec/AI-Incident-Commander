@@ -43,7 +43,7 @@ class ExecutionClaim:
 
         if (
             type(self.policy_version) is not str
-            or fullmatch(r"apv:v1:[0-9a-f]{64}", self.policy_version) is None
+            or fullmatch(r"apv:v[12]:[0-9a-f]{64}", self.policy_version) is None
         ):
             raise ValueError("Execution claim requires a valid policy version.")
 

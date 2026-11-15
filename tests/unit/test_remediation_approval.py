@@ -56,6 +56,16 @@ def test_approval_request_preserves_all_fields() -> None:
     assert request.expires_at == _EXPIRES_AT
 
 
+@pytest.mark.parametrize(
+    "policy_version",
+    ["apv:v1:" + "b" * 64, "apv:v2:" + "b" * 64],
+)
+def test_approval_request_accepts_supported_policy_versions(policy_version: str) -> None:
+    request = _make_request(policy_version=policy_version)
+
+    assert request.policy_version == policy_version
+
+
 def test_approval_request_generates_unique_request_ids() -> None:
     first = RemediationApprovalRequest(
         plan_id=_PLAN_ID,
@@ -133,7 +143,7 @@ def test_approval_request_rejects_non_string_fingerprint(
     "policy_version",
     [
         "",
-        "apv:v2:" + "b" * 64,
+        "apv:v3:" + "b" * 64,
         "apv:v1:" + "b" * 63,
         "apv:v1:" + "g" * 64,
         "apv:v1:" + "B" * 64,

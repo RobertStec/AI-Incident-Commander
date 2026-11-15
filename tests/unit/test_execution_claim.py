@@ -39,6 +39,16 @@ def test_claim_preserves_approved_scope_and_generates_identifier() -> None:
     assert claim.claimed_at == _CLAIMED_AT
 
 
+@pytest.mark.parametrize(
+    "policy_version",
+    ["apv:v1:" + "b" * 64, "apv:v2:" + "b" * 64],
+)
+def test_claim_accepts_supported_policy_versions(policy_version: str) -> None:
+    claim = _make_claim(policy_version=policy_version)
+
+    assert claim.policy_version == policy_version
+
+
 def test_claim_accepts_explicit_id_for_database_reconstruction() -> None:
     claim_id = uuid4()
     claim = _make_claim(claim_id=claim_id)
@@ -70,7 +80,7 @@ def test_claim_rejects_invalid_fingerprint(bad_value: object) -> None:
 
 @pytest.mark.parametrize(
     "bad_value",
-    ["", "apv:v2:" + "b" * 64, "apv:v1:" + "G" * 64, None],
+    ["", "apv:v3:" + "b" * 64, "apv:v1:" + "G" * 64, None],
 )
 def test_claim_rejects_invalid_policy_version(bad_value: object) -> None:
     with pytest.raises(ValueError, match="policy version"):
