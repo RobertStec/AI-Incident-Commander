@@ -7,16 +7,16 @@
 
 ## 1. Aktualny stan projektu
 
-- **Obszar:** **Phase 2.0 — LangGraph Core**. Podetapy **2.0.1–2.0.3** zakończone i zapisane w Git; **2.0.4 — Investigation Planning & Workflow Routing** technicznie zakończony (implementacja, testy lokalne, pełna regresja), oczekuje na aktualizację dokumentacji i commit/push.
-- **Ostatni kamień milowy:** `InvestigationPlanSnapshot` w `IncidentState`, walidowany plan diagnostyczny, wstrzykiwany asynchroniczny planner (domyślnie deterministyczny) i routing wybierający `logs`, `metrics` albo obie gałęzie. Agregacja następuje po wykonaniu wybranych kolektorów.
-- **Stan orkiestracji:** `IncidentState` jest niezależny od domenowego `Incident`; przechowuje serializowalne snapshoty incydentu, dowodów i hipotez oraz opcjonalny `investigation_plan`. `merge_evidence()` deduplikuje po `evidence_id`, zapewnia deterministyczny porządek i odrzuca konflikty treści. Plan pozostaje polem *single-writer*, bez reducera.
-- **Weryfikacja Phase 2.0.4 (2026-11-16):** **42 passed** w dwóch plikach testowych stanu i grafu; Ruff lint **PASSED**, Ruff format **118 plików już sformatowanych**, Mypy strict **54 pliki, 0 błędów**. Przetestowano m.in. dobór źródeł, współbieżność, synchronizację, pojedynczą agregację, walidację planu i bezpieczne scalanie dowodów.
-- **Ostatnia potwierdzona pełna regresja:** **1472 passed, 0 failed** (2026-11-16; 44,49 s; `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1`, z testami PostgreSQL). Wzrost o 16 testów względem ostatniej pełnej regresji 2.0.3 (**1456 passed**).
-- **LangGraph:** według przebiegu prac dodano wersję **1.2.22** przez `uv`; bez podłączonego LLM/MCP, trwałych checkpointów i automatycznych retry. Bieżący graf służy diagnostyce i nie wykonuje mutujących działań.
+- **Obszar:** **Phase 2.0 — LangGraph Core**. Podetapy **2.0.1–2.0.4** ukończone i zapisane w Git; **2.0.5 — Investigator Subgraph** ukończony technicznie (kontrakt, samodzielny subgraf, integracja z koordynatorem oraz testy), ale **jeszcze bez potwierdzonego commita/pusha**.
+- **Ostatni kamień milowy:** prawdziwa kompozycja grafów: **Main Incident Graph** wykonuje `intake` i przekazuje sterowanie do **Investigator Subgraph** (`investigation_planner → conditional routing → collect_logs / collect_metrics → aggregate_evidence`). `build_incident_graph()` zachowuje dotychczasowe publiczne API.
+- **Kontrakt stanu:** `InvestigatorState` zawiera `incident`, `workflow_phase`, `investigation_plan` i `evidence`; `IncidentState` rozszerza go o `hypotheses`. Współdzielony `merge_evidence()` deduplikuje dowody po stabilnym `evidence_id`, deterministycznie sortuje i odrzuca konflikty. Plan diagnostyczny pozostaje polem *single-writer*.
+- **Weryfikacja Phase 2.0.5 (2026-11-16):** **67 passed** w trzech plikach testowych (`test_incident_state.py`, `test_incident_graph.py`, `test_investigator_graph.py`); Ruff lint **PASSED**, Ruff format **120 plików poprawnie sformatowanych**, Mypy strict **55 plików źródłowych, 0 błędów**. Testowano m.in. routing, współbieżność, granicę parent/subgraph, ponowne dowody, konflikty identyfikatorów, izolację danych i propagowanie błędów.
+- **Ostatnia potwierdzona pełna regresja:** **1497 passed, 0 failed** (2026-11-16; 22,13 s; `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1`, z włączonymi testami PostgreSQL), czyli o **25** więcej niż po Phase 2.0.4 (**1472 passed**).
+- **LangGraph:** w przebiegu prac odnotowano **1.2.22**; obecne grafy diagnostyczne nie korzystają jeszcze z LLM, MCP, trwałych checkpointów, automatycznych retry ani akcji mutujących.
 - **Zachowane zabezpieczenia remediation/MCP:** `apv:v2`, Guard, durable dispatch i kontrakt `SecureMcpExecutor` pozostają odrębną warstwą; rzeczywisty executor MCP i efekty zewnętrzne nadal **nie są** zaimplementowane.
 - **PostgreSQL / Alembic:** ostatnio potwierdzony lokalny stan `e62b4f0c91ad (head)` — dopuszczono `apv:v1`/`apv:v2` w dwóch `CHECK`; 6 testów schematu zaliczonych (2026-11-15).
-- **Git:** Phase 2.0.3 zatwierdzony i wypchnięty jako **`592c5ef`** (`feat(orchestration): add initial parallel LangGraph incident workflow`); po push potwierdzono `main...origin/main` oraz czyste drzewo. **Stan Git po zmianach 2.0.4 nie został jeszcze ponownie sprawdzony** — nie zakładać stagingu, commita ani synchronizacji nowych zmian.
-- **Teraz:** zapisać ten kamień milowy w dokumentacji, sprawdzić rzeczywisty `git status` i diff 2.0.4, uzgodnić staging, commit/push i potwierdzić synchronizację. Następnie wybrać kolejny mały krok LangGraph Core na podstawie aktualnych pełnych plików, bez rozpoczynania transportu MCP.
+- **Git:** Phase 2.0.3: commit/push **`592c5ef`**; Phase 2.0.4: commit/push **`0e5ee49`** (`feat(orchestration): add investigation planning and conditional routing`). Po push 2.0.4 potwierdzono czyste drzewo oraz `main...origin/main`. **Aktualnego statusu Git po zmianach 2.0.5 jeszcze nie sprawdzono.**
+- **Teraz:** sprawdzić Git i pełny zakres zmian Phase 2.0.5 (także nowe, nieśledzone pliki), wykonać kontrolowany staging, commit i push. Potem zaplanować mały krok dotyczący checkpointingu/durable execution, bez deklarowania ich jako już zaimplementowanych.
 
 ## 2. Kluczowe decyzje i granice bezpieczeństwa
 
@@ -120,20 +120,27 @@
 - **Testy i typowanie:** **26 passed** (12 testów grafu + 14 stanu), Ruff lint/format **PASSED** (118 plików), Mypy strict **PASSED** (54 pliki, bez błędów). **Pełna regresja po zmianach: 1456 passed, 0 failed (2026-11-16, 22,57 s, z aktywnymi testami PostgreSQL).**
 - **Repozytorium:** commit/push **`592c5ef`** na `main`/`origin/main` potwierdzony 2026-11-16; po zakończeniu 2.0.3 drzewo Git było czyste.
 
-
 ### 2026-11-16 — Phase 2.0.4: Investigation Planning & Workflow Routing
 
 - **2.0.4.1 — kontrakt planu:** dodano `InvestigationPlanSnapshot` (`sources`, `rationale`) i `investigation_plan: InvestigationPlanSnapshot | None` do `IncidentState`; `initial_incident_state()` ustawia `None`. Walidacja odrzuca pusty plan, duplikaty i nieobsługiwane źródła; plan nie ma reducera (*single-writer*).
 - **2.0.4.2 — planner:** dodano node planowania oraz wstrzykiwany asynchroniczny `InvestigationPlanner`. Domyślny deterministyczny planner wybiera `logs` i `metrics`. Wyjście planera jest walidowane ponownie przed zebraniem dowodów; wejściowy snapshot incydentu pozostaje izolowany od zmian planera.
 - **2.0.4.3 — routing:** plan steruje wyborem `collect_logs`, `collect_metrics` albo obu kolektorów. Zmodyfikowano synchronizację tak, aby agregacja działała także dla jednej wybranej gałęzi i wykonywała się jednokrotnie. Przy dwóch źródłach zachowano równoległość i reducer `merge_evidence()`.
 - **Weryfikacja:** **42 passed** w testach stanu i grafu; Ruff lint **PASSED**, Ruff format **118 plików**, Mypy strict **54 pliki, 0 błędów**. **Pełna regresja: 1472 passed, 0 failed (2026-11-16, 44,49 s, z testami PostgreSQL).**
-- **Granice:** brak LLM, MCP, trwałych checkpointów, automatycznych retry i efektów mutujących. **Status Git tej grupy zmian do sprawdzenia przed commitem**.
+- **Granice:** brak LLM, MCP, trwałych checkpointów, automatycznych retry i efektów mutujących. **Repozytorium:** commit/push **`0e5ee49`** na `main`/`origin/main` potwierdzony 2026-11-16; po zakończeniu 2.0.4 drzewo Git było czyste.
+
+### 2026-11-16 — Phase 2.0.5: Investigator Subgraph i integracja parent/subgraph
+
+- **2.0.5.1 — kontrakt:** wydzielono `InvestigatorState` (`incident`, `workflow_phase`, `investigation_plan`, `evidence`) i zdefiniowano `IncidentState` jako rozszerzenie z polem `hypotheses`. Reducer `merge_evidence()` jest współdzielony, bez zmiany snapshotów i domenowych reguł biznesowych.
+- **2.0.5.2 — samodzielny subgraf:** dodano `investigator_graph.py` i `build_investigator_graph()`. Subgraf przyjmuje stan w fazie `planning`, tworzy/waliduje plan, warunkowo wybiera źródła `logs`/`metrics`, równolegle zbiera dowody i synchronizuje agregację przez `defer=True`. Kolektory pozostają wstrzykiwane i read-only.
+- **2.0.5.3 — integracja:** `Main Incident Graph` odpowiada za `intake`, a skompilowany Investigator jest osadzony jako node. Usunięto przejściowe powielenie logiki diagnostycznej w koordynatorze; zachowano API `build_incident_graph()` i zgodność dotychczasowych wyjątków. `hypotheses` pozostaje kanałem tylko grafu nadrzędnego. Testy obejmują przekazanie istniejących dowodów, deduplikację i konflikty przy granicy grafów, wykonanie jednego/dwóch kolektorów, izolację stanu i obserwację subgrafu.
+- **Weryfikacja:** **67 passed** (trzy pliki unit), Ruff lint **PASSED**, Ruff format **120 plików**, Mypy strict **55 plików, 0 błędów**. **Pełna regresja: 1497 passed, 0 failed (2026-11-16, 22,13 s, z włączonymi testami PostgreSQL)**.
+- **Granice:** brak trwałego checkpointera/wznowień, `interrupt()`, retry i rzeczywistych MCP/LLM; reducer nie gwarantuje exactly-once efektów zewnętrznych. **Status Git zmian 2.0.5: niepotwierdzony — przed commitem zweryfikować staging i untracked.**
 
 ## 4. Pozostały zakres i następny krok Phase 2.0
 
-**Zamknięcie 2.0.4 w repo:** implementacja, testy grafu, Ruff, Mypy i pełna regresja PostgreSQL zakończone pomyślnie. Należy sprawdzić bieżący stan Git, przejrzeć diff (`incident_state.py`, `incident_graph.py`, testy i dokumentacja — rzeczywisty zakres ustalić przez `git status`), świadomie dodać zmiany do stagingu, wykonać commit/push i potwierdzić synchronizację `main`/`origin/main`. Nie utożsamiać zielonych testów z zapisaniem zmian w Git.
+**Zamknięcie 2.0.5 w repo:** implementacja, testy jednostkowe, Ruff, Mypy i pełna regresja PostgreSQL zakończone pomyślnie. Nadal należy sprawdzić bieżący `git status`, diff oraz **nieśledzone** pliki (w szczególności nowy `investigator_graph.py` i testy), uzgodnić staging, sprawdzić `git diff --cached --check`/`--stat`, wykonać commit/push i potwierdzić synchronizację. Nie utożsamiać zielonych testów z commitem lub wdrożeniem.
 
-**Dalszy LangGraph Core:** po zamknięciu 2.0.4 iteracyjnie rozwijać orkiestrację (kolejne źródła dowodów, subgrafy, checkpointing/durable execution oraz kontrolowana obsługa błędów i retry). `interrupt()` i bezpieczne wznowienie Human-in-the-Loop pozostają do wdrożenia we właściwym etapie. Kolejny zakres ustalić po analizie całych aktualnych plików; nie traktować planów jako implementacji.
+**Dalszy LangGraph Core:** po zamknięciu 2.0.5 rozważyć jako następny etap kontrakt checkpointingu i durable execution: stabilne `thread_id`, persystencja stanu, odczyt/wznowienie oraz testy awarii i powtórnego uruchomienia. Nie podłączać od razu działań mutujących; politykę retry i `interrupt()`/HITL projektować świadomie wobec skutków zewnętrznych. Kolejny podetap ustalić po analizie całych aktualnych plików i aktualnej dokumentacji.
 
 **Odłożone do właściwych faz:** bezpieczny executor MCP i gateway, pinning/integralność konfiguracji serwerów, resource preconditions, downstream idempotency i reconciliation `UNKNOWN`, klienci/serwery MCP, zaawansowany RAG, obserwowalność, CI/CD oraz wdrożenie. PostgreSQL nie gwarantuje exactly-once skutków zewnętrznych.
 

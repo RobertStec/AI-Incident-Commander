@@ -123,17 +123,25 @@ def merge_evidence(
     return [deepcopy(indexed[evidence_id]) for evidence_id in sorted(indexed)]
 
 
-class IncidentState(TypedDict):
-    """Initial StateGraph contract. Nodes return partial state updates.
+class InvestigatorState(TypedDict):
+    """Shared diagnostic channels for the coordinator and investigator subgraph.
 
-    Evidence has a reducer to accept parallel investigators. Hypotheses are
-    intentionally single-writer until a domain-safe update policy is defined.
+    Evidence uses the same idempotent reducer on both sides of the graph boundary.
+    Subgraph execution and cross-graph updates are verified separately.
     """
 
     incident: IncidentSnapshot
     workflow_phase: WorkflowPhase
     investigation_plan: InvestigationPlanSnapshot | None
     evidence: Annotated[list[EvidenceSnapshot], merge_evidence]
+
+
+class IncidentState(InvestigatorState):
+    """Coordinator state: diagnostic channels plus downstream hypotheses.
+
+    Hypotheses remain single-writer until a domain-safe update policy is defined.
+    """
+
     hypotheses: list[HypothesisSnapshot]
 
 

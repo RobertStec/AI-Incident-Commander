@@ -1,4 +1,4 @@
-"""Unit tests for the first real LangGraph fan-out/fan-in incident workflow."""
+"""Coordinator tests for the nested Investigator subgraph workflow."""
 
 import asyncio
 import json
@@ -8,8 +8,10 @@ from typing import cast
 from uuid import UUID
 
 import pytest
+from langgraph.graph import END, START
 
 from ai_incident_commander.domain.evidence import Evidence, EvidenceType
+from ai_incident_commander.domain.hypothesis import Hypothesis
 from ai_incident_commander.domain.incident import Incident
 from ai_incident_commander.orchestration.incident_graph import (
     EvidenceCollector,
@@ -24,6 +26,8 @@ from ai_incident_commander.orchestration.incident_state import (
     InvestigationPlanSnapshot,
     InvestigationSource,
     initial_incident_state,
+    snapshot_evidence,
+    snapshot_hypothesis,
 )
 
 _INCIDENT_ID = UUID(int=100)
@@ -374,8 +378,13 @@ def test_deferred_aggregation_runs_once_after_exactly_the_selected_collectors(
             investigation_planner=planner,
         )
         executed: list[str] = []
-        async for update in graph.astream(_state(), stream_mode="updates"):
-            executed.extend(update.keys())
+        async for namespace, update in graph.astream(
+            _state(), stream_mode="updates", subgraphs=True
+        ):
+            if namespace:
+                # Only investigator-internal nodes; parent emits a separate
+                # update named "investigator" after its child completes.
+                executed.extend(update.keys())
         return executed
 
     executed = asyncio.run(scenario())
@@ -405,3 +414,109 @@ def test_two_collectors_produce_stable_evidence_regardless_of_plan_order() -> No
     ]
     assert result["investigation_plan"] is not None
     assert result["investigation_plan"]["sources"] == ["metrics", "logs"]
+
+
+def test_coordinator_contains_a_compiled_investigator_node() -> None:
+    graph = build_incident_graph(collect_logs=_collector(), collect_metrics=_collector())
+
+    assert set(graph.get_graph().nodes) == {START, "intake", "investigator", END}
+    assert "collect_logs" not in graph.get_graph().nodes
+    assert "investigation_planner" not in graph.get_graph().nodes
+
+
+def test_parent_preserves_hypotheses_while_investigator_updates_evidence() -> None:
+    state = _state()
+    hypothesis = snapshot_hypothesis(
+        Hypothesis(
+            hypothesis_id=UUID(int=40),
+            incident_id=_INCIDENT_ID,
+            statement="A deployment regression may explain the errors",
+            reasoning="Errors followed the latest deployment",
+            created_at=_OBSERVED_AT,
+            updated_at=_OBSERVED_AT,
+        )
+    )
+    state["hypotheses"] = [hypothesis]
+
+    result = _run(logs=_collector(_observation(1)), metrics=_collector(), state=state)
+
+    assert result["hypotheses"] == [hypothesis]
+    assert state["hypotheses"] == [hypothesis]
+    assert len(result["evidence"]) == 1
+
+
+def test_parent_unions_existing_and_new_evidence_across_subgraph_boundary() -> None:
+    state = _state()
+    original_evidence = snapshot_evidence(_observation(10))
+    state["evidence"] = [original_evidence]
+    untouched = deepcopy(state)
+
+    result = _run(
+        logs=_collector(_observation(1)),
+        metrics=_collector(_observation(2, evidence_type=EvidenceType.METRIC)),
+        state=state,
+    )
+
+    assert [item["evidence_id"] for item in result["evidence"]] == [
+        str(UUID(int=1)),
+        str(UUID(int=2)),
+        str(UUID(int=10)),
+    ]
+    assert state == untouched
+
+
+def test_parent_deduplicates_preexisting_evidence_replayed_by_subgraph() -> None:
+    state = _state()
+    repeated = _observation(1)
+    state["evidence"] = [snapshot_evidence(repeated)]
+
+    result = _run(logs=_collector(repeated), metrics=_collector(), state=state)
+
+    assert result["evidence"] == [snapshot_evidence(repeated)]
+
+
+def test_parent_detects_conflict_with_evidence_already_in_state() -> None:
+    state = _state()
+    state["evidence"] = [snapshot_evidence(_observation(1))]
+
+    with pytest.raises(EvidenceSnapshotConflictError, match="Conflicting evidence"):
+        _run(
+            logs=_collector(_observation(1, summary="Contradictory observation")),
+            metrics=_collector(),
+            state=state,
+        )
+
+
+def test_parent_retains_investigator_error_type_identity() -> None:
+    from ai_incident_commander.orchestration.investigator_graph import (
+        EvidenceIncidentMismatchError as SubgraphEvidenceIncidentMismatchError,
+    )
+
+    assert EvidenceIncidentMismatchError is SubgraphEvidenceIncidentMismatchError
+
+
+def test_parent_stream_emits_one_subgraph_completion_after_aggregation() -> None:
+    async def scenario() -> tuple[list[str], list[str]]:
+        graph = build_incident_graph(
+            collect_logs=_collector(_observation(1)),
+            collect_metrics=_collector(_observation(2, evidence_type=EvidenceType.METRIC)),
+        )
+        parent_events: list[str] = []
+        child_events: list[str] = []
+        async for namespace, update in graph.astream(
+            _state(), stream_mode="updates", subgraphs=True
+        ):
+            if namespace:
+                child_events.extend(update.keys())
+            else:
+                parent_events.extend(update.keys())
+        return parent_events, child_events
+
+    parent, child = asyncio.run(scenario())
+
+    assert parent == ["intake", "investigator"]
+    assert child.count("investigation_planner") == 1
+    assert child.count("collect_logs") == 1
+    assert child.count("collect_metrics") == 1
+    assert child.count("aggregate_evidence") == 1
+    assert child[-1] == "aggregate_evidence"

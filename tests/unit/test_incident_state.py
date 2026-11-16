@@ -15,6 +15,7 @@ from ai_incident_commander.orchestration.incident_state import (
     EvidenceSnapshotConflictError,
     IncidentState,
     InvestigationSource,
+    InvestigatorState,
     create_investigation_plan,
     initial_incident_state,
     merge_evidence,
@@ -237,3 +238,56 @@ def test_state_defines_evidence_reducer_but_not_hypothesis_reducer() -> None:
     assert get_args(hints["evidence"])[1] is merge_evidence
     assert get_origin(hints["hypotheses"]) is list
     assert get_origin(hints["investigation_plan"]) is not Annotated
+
+
+def test_investigator_state_has_only_diagnostic_channels() -> None:
+    hints = get_type_hints(InvestigatorState, include_extras=True)
+
+    assert set(hints) == {
+        "incident",
+        "workflow_phase",
+        "investigation_plan",
+        "evidence",
+    }
+    assert InvestigatorState.__required_keys__ == frozenset(hints)
+    assert "hypotheses" not in hints
+
+
+def test_incident_state_extends_investigator_channels_without_redefinition() -> None:
+    investigator_hints = get_type_hints(InvestigatorState, include_extras=True)
+    incident_hints = get_type_hints(IncidentState, include_extras=True)
+
+    assert set(incident_hints) == {*investigator_hints, "hypotheses"}
+    assert IncidentState.__required_keys__ == frozenset(incident_hints)
+    for field, annotation in investigator_hints.items():
+        assert incident_hints[field] == annotation
+
+
+def test_investigator_state_inherits_the_evidence_reducer() -> None:
+    hints = get_type_hints(InvestigatorState, include_extras=True)
+
+    assert get_origin(hints["evidence"]) is Annotated
+    assert get_args(hints["evidence"])[1] is merge_evidence
+    assert get_origin(hints["investigation_plan"]) is not Annotated
+
+
+def test_investigator_projection_is_json_safe_and_does_not_expose_hypotheses() -> None:
+    parent = initial_incident_state(_incident())
+    parent["investigation_plan"] = create_investigation_plan(
+        sources=["logs"], rationale="Examine request failures."
+    )
+    parent["evidence"] = [snapshot_evidence(_evidence())]
+    parent["hypotheses"] = [snapshot_hypothesis(_hypothesis())]
+
+    # The projection is explicit here; parent/subgraph wiring comes in 2.0.5.3.
+    diagnostic = InvestigatorState(
+        incident=deepcopy(parent["incident"]),
+        workflow_phase=parent["workflow_phase"],
+        investigation_plan=deepcopy(parent["investigation_plan"]),
+        evidence=deepcopy(parent["evidence"]),
+    )
+
+    assert "hypotheses" not in diagnostic
+    assert json.loads(json.dumps(diagnostic, allow_nan=False)) == diagnostic
+    diagnostic["evidence"][0]["metadata"]["error_rate"] = 0.5
+    assert parent["evidence"][0]["metadata"]["error_rate"] == 0.15
