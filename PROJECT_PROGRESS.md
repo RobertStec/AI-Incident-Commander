@@ -7,15 +7,16 @@
 
 ## 1. Aktualny stan projektu
 
-- **Obszar:** Human-in-the-Loop / durable remediation oraz **MCP Binding Version & Approval Integrity** — przygotowanie zakończone na poziomie kontraktów i testów; prawdziwy executor MCP nadal nie istnieje.
-- **Ostatni kamień milowy:** `1.7.8.11.42.7.5.11` — `SecureMcpExecutor` Protocol i model `McpInvocationResult` (`ACKNOWLEDGED`, `REJECTED`, `UNKNOWN`), bez transportu ani efektów zewnętrznych. Kontrakt: **17 testów passed**.
-- **MCP-bound Composition Root:** `mcp_approval_workflow_lifespan()` wiąże serwis żądań i Guard z tymi samymi zaufanymi `TrustedMcpActionBindings`; **25 testów** (12 istniejących + 13 nowych) zaliczonych.
-- **Ostatnia potwierdzona pełna regresja:** **1400 passed, 0 failed** (2026-11-15; `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1`, PostgreSQL; 29,85 s). Wykonana **przed** dodaniem najnowszych 13 testów MCP Bootstrap i 17 testów kontraktu Executora; pełną regresję trzeba powtórzyć.
-- **Najnowsza kontrola statyczna:** Ruff lint **PASSED**, Ruff format **114 plików**, Mypy **52 pliki źródłowe**, bez błędów (2026-11-15, po dodaniu kontraktu Executora).
-- **PostgreSQL / Alembic:** lokalnie zastosowano `e62b4f0c91ad (head)` — dopuszczono `apv:v1`/`apv:v2` w dwóch ograniczeniach `CHECK`; testy schematu **6 passed**. Nie modyfikowano historycznych migracji.
-- **Git:** ostatni **potwierdzony** commit/push: `7d49058` (`security: remove unverified remediation dispatch reservation`); `main` i `origin/main` były wówczas zsynchronizowane. **Aktualny stan Git po dalszych pracach nie został potwierdzony** — nie zakładać czystego drzewa ani commita zmian `apv:v2`.
-- **Dokumentacja portfolio:** przygotowano `README.md` z widoczną sekcją ewolucji `apv:v1 → apv:v2` oraz `docs/adr/0001-mcp-bound-approval-policy-versioning.md`; ich umieszczenie w bieżącym repo i staging trzeba potwierdzić przez `git status`.
-- **Teraz:** uzupełnić checkpoint `PROJECT_PROGRESS.md` / `SESSION_HANDOFF.md`, ponowić końcową regresję i kontrolę jakości, sprawdzić pełny `git status` (także nowe pliki), następnie uzgodniony staging, commit i push. **Po checkpointcie:** audyt minimum Foundation i wejście w **Phase 2.0 — LangGraph Core**. Nie implementować teraz transportu MCP.
+- **Obszar:** **Phase 2.0 — LangGraph Core**. Podetapy **2.0.1 (audyt zależności)**, **2.0.2 (IncidentState)** i **2.0.3 (First LangGraph StateGraph)** ukończone na poziomie zaplanowanej implementacji i lokalnych testów.
+- **Ostatni kamień milowy:** pierwszy rzeczywisty asynchroniczny `StateGraph`: `START → intake → (collect_logs || collect_metrics) → aggregate_evidence → END`; obie gałęzie zbierają dowody równolegle, a agregacja czeka na ich zakończenie.
+- **Stan orkiestracji:** `IncidentState` jest niezależny od domenowego `Incident`; używa serializowalnych snapshotów i reducera `merge_evidence()` (scalanie po `evidence_id`, deduplikacja, deterministyczna kolejność, odmowa przy konflikcie treści). Kolektory są wstrzykiwane, asynchroniczne i zwracają domenowe `Evidence` konwertowane na snapshoty.
+- **Weryfikacja Phase 2.0.3 (2026-11-16):** **26 passed** w `tests/unit/test_incident_graph.py` i `tests/unit/test_incident_state.py` (12 + 14); Ruff lint **PASSED**, Ruff format **118 plików już sformatowanych**, Mypy strict **54 pliki, 0 błędów**. Testy obejmują m.in. synchronizację, deduplikację, konflikt ID, walidację powiązania z incydentem i serializację.
+- **Ostatnia potwierdzona pełna regresja:** **1456 passed, 0 failed** (2026-11-16; 22,57 s; `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1`, uruchomione testy PostgreSQL). Wykonana po dodaniu testów MCP Bootstrap/Executora i pierwszego grafu LangGraph.
+- **LangGraph:** według przebiegu prac dodano `langgraph==1.2.22` przez `uv`; zależność pojawiła się w `pyproject.toml` i `uv.lock`. Bez podłączonego LLM/MCP, trwałych checkpointów czy automatycznych retry w pierwszym grafie.
+- **Zachowane zabezpieczenia remediation/MCP:** wcześniejsze `apv:v2`, Guard, durable dispatch i kontrakt `SecureMcpExecutor` pozostają odrębną warstwą; rzeczywisty executor MCP i efekty zewnętrzne nadal **nie są** zaimplementowane.
+- **PostgreSQL / Alembic:** ostatnio potwierdzony lokalny stan `e62b4f0c91ad (head)` — dopuszczono `apv:v1`/`apv:v2` w dwóch `CHECK`; 6 testów schematu zaliczonych (2026-11-15).
+- **Git (odczyt 2026-11-16):** `main...origin/main` bez wykazanego rozjazdu; **7 plików w stagingu**: `PROJECT_PROGRESS.md`, `pyproject.toml`, `uv.lock`, `orchestration/incident_state.py`, `orchestration/incident_graph.py` i dwa testy jednostkowe. `git diff --cached --check` bez uwag; nie potwierdzono jeszcze commita ani push. Ostatni commit/push odnotowany w starszym checkpointcie: `7d49058`; aktualnego `HEAD` nie potwierdzono osobnym poleceniem.
+- **Teraz:** zakończyć przegląd staged zmian (w szczególności `uv.lock`), następnie wykonać uzgodniony commit/push i zweryfikować synchronizację Git. Po tym kontynuować LangGraph Core, bez implementowania transportu MCP w tym kroku.
 
 ## 2. Kluczowe decyzje i granice bezpieczeństwa
 
@@ -30,6 +31,7 @@
 - **Kontrakt wykonania MCP, bez implementacji:** `SecureMcpExecutor.execute_for_step(request_id, step)` nie bierze od wywołującego `dispatch_id`, `execution_id` ani `VerifiedExecutionScope` jako praw do wykonania. `McpInvocationResult` rozróżnia `ACKNOWLEDGED`, `REJECTED`, `UNKNOWN`; ACK nie oznacza zweryfikowanego usunięcia incydentu.
 - **Granice systemów rozproszonych:** PostgreSQL zapewnia jednorazową **rezerwację**, nie exactly-once efektu zewnętrznego. Po crashu/timeout brak automatycznego retry mutującego MCP; wymagane będą downstream idempotency, preconditions i reconciliation. `server_id` to alias — zmiana endpointu/poświadczeń/semantyki za aliasem nie musi zmieniać `binding_version`; przed prawdziwym MCP potrzebne pinning i integralność konfiguracji.
 - **Brak produkcyjnych efektów MCP:** brak gotowego wykonawcy, klienta/serwerów MCP, gwarantowanego authorization boundary w systemie docelowym, LangGraph durable resume oraz produkcyjnego RBAC/auth. Niczego z tego nie oznaczamy jako ukończone.
+- **LangGraph ↔ domena:** `Incident` pozostaje źródłem reguł biznesowych (w tym kontrolowanego przejścia do `RESOLVED`); `IncidentState` to stan orkiestracji, bez połączeń DB, klientów MCP czy sekretów. Reducer dowodów scala wyniki gałęzi, ale sam nie zapewnia idempotencji operacji zewnętrznych ani durable execution.
 
 ## 3. Kamienie milowe
 
@@ -110,13 +112,23 @@
 - Ostatni Ruff lint / format / Mypy: **PASSED** (114 sformatowanych plików, 52 pliki źródłowe).
 - Przygotowano `README.md` i `docs/adr/0001-mcp-bound-approval-policy-versioning.md`, które **uczciwie** opisują rzeczywistą, niewcześniej zaplanowaną ewolucję `apv:v1 → apv:v2`, powody i koszty migracji oraz ograniczenia. Stan dodania do repo i commit należy potwierdzić.
 
-## 4. Pozostały zakres i punkt rozpoczęcia Phase 2.0
+### 2026-11-16 — Phase 2.0.1–2.0.3: IncidentState i pierwszy równoległy LangGraph
 
-**Przed Phase 2.0:** końcowa pełna regresja po Composition Root i kontrakcie Executora; Ruff/Mypy; potwierdzenie README/ADR i dokumentów checkpointu w repo; kontrola Git, świadomy staging, commit/push; weryfikacja minimalnych elementów Foundation. Nie dopisywać w tym bloku nowego transportu MCP.
+- **2.0.1 — audyt:** potwierdzono gotowość istniejącego stacku Python 3.12 do wprowadzenia orkiestracji; zależności AI dodawane stopniowo, na początku tylko LangGraph (w przebiegu prac: 1.2.22).
+- **2.0.2 — stan:** zaimplementowano `IncidentState` oparty na `TypedDict` / `Annotated`, serializowalne snapshoty danych domenowych oraz `merge_evidence()` deduplikujący po stabilnym `evidence_id` bez mutowania danych. Domena i jej reguły przejść nie zostały zmienione.
+- **2.0.3 — graf:** `START → intake → collect_logs || collect_metrics → aggregate_evidence → END`. Asynchroniczne wstrzykiwane kolektory, walidacja `incident_id`, oczekiwanie agregatora na obie gałęzie i scalanie dowodów przez reducer. Dane zewnętrzne, LLM, retry i trwałe checkpointy pozostają poza zakresem pierwszego grafu.
+- **Testy i typowanie:** **26 passed** (12 testów grafu + 14 stanu), Ruff lint/format **PASSED** (118 plików), Mypy strict **PASSED** (54 pliki, bez błędów). **Pełna regresja po zmianach: 1456 passed, 0 failed (2026-11-16, 22,57 s, z aktywnymi testami PostgreSQL).**
+- **Repozytorium:** 7 plików objętych stagingiem, w tym zależności, dwa nowe pliki orkiestracji, dwa testy i `PROJECT_PROGRESS.md`; `git diff --cached --check` bez uwag. Commit/push etapu niepotwierdzone.
 
-**Odłożone do właściwych faz (nie stanowią warunku rozpoczęcia Phase 2):** bezpieczna implementacja MCP Executora i Gateway, autentykacja/pinning MCP server, konfiguracja aliasów i jej wersjonowanie, preconditions zasobu, downstream idempotency, reconciliation `UNKNOWN`, faktyczne narzędzia i klient MCP; LangGraph orchestration/HITL interrupts/checkpointing, RAG, obserwowalność, CI/CD oraz produkcyjny deployment. Brak gwarancji exactly-once poza PostgreSQL.
+## 4. Pozostały zakres i następny krok Phase 2.0
 
-**Dokumentacja:** w README sekcja „Architecture evolution: `apv:v1` → `apv:v2`” jest widoczna wysoko na stronie; szczegóły w `docs/adr/0001-mcp-bound-approval-policy-versioning.md`. Nie przedstawiać `apv:v1` jako eksperymentu świadomie zaplanowanego od początku.
+**Zamknięcie 2.0.3 w repo:** lokalne testy grafu, Ruff, Mypy i pełna regresja PostgreSQL zakończone pomyślnie. Zmiany obejmujące 7 plików zostały dodane do stagingu; `uv lock --check` pomyślny, `git diff --cached --check` bez uwag. Pozostały końcowy przegląd zakresu zależności (`uv.lock`), commit i push. Nie utożsamiać wyników testów ani stagingu z commitem lub wdrożeniem.
+
+**Dalszy LangGraph Core:** po uporządkowaniu 2.0.3 iteracyjnie rozbudować orkiestrację (plan analizy, routing, kolejne źródła dowodów i subgrafy), następnie checkpointing / durable execution, kontrolowaną obsługę błędów i retry, a w odpowiednim etapie `interrupt()` i bezpieczne wznowienie HITL. Kolejność i kontrakty następnych nodów zatwierdzić na podstawie aktualnych pełnych plików, nie domniemywać implementacji.
+
+**Odłożone do właściwych faz:** bezpieczny executor MCP i gateway, pinning/integralność konfiguracji serwerów, resource preconditions, downstream idempotency i reconciliation `UNKNOWN`, klienci/serwery MCP, zaawansowany RAG, obserwowalność, CI/CD oraz wdrożenie. PostgreSQL nie gwarantuje exactly-once skutków zewnętrznych.
+
+**Dokumentacja:** zachować uczciwy opis ewolucji `apv:v1 → apv:v2` w README i `docs/adr/0001-mcp-bound-approval-policy-versioning.md`. `PROJECT_PROGRESS.md` aktualizować przy kamieniach milowych; `SESSION_HANDOFF.md` służy wznowieniu kontekstu, nie rejestrowaniu każdego drobnego kroku.
 
 ## 5. Wznowienie pracy i zasady współpracy
 
