@@ -7,16 +7,16 @@
 
 ## 1. Aktualny stan projektu
 
-- **Obszar:** **Phase 2.0 — LangGraph Core**. Podetapy **2.0.1 (audyt zależności)**, **2.0.2 (IncidentState)** i **2.0.3 (First LangGraph StateGraph)** ukończone na poziomie zaplanowanej implementacji i lokalnych testów.
-- **Ostatni kamień milowy:** pierwszy rzeczywisty asynchroniczny `StateGraph`: `START → intake → (collect_logs || collect_metrics) → aggregate_evidence → END`; obie gałęzie zbierają dowody równolegle, a agregacja czeka na ich zakończenie.
-- **Stan orkiestracji:** `IncidentState` jest niezależny od domenowego `Incident`; używa serializowalnych snapshotów i reducera `merge_evidence()` (scalanie po `evidence_id`, deduplikacja, deterministyczna kolejność, odmowa przy konflikcie treści). Kolektory są wstrzykiwane, asynchroniczne i zwracają domenowe `Evidence` konwertowane na snapshoty.
-- **Weryfikacja Phase 2.0.3 (2026-11-16):** **26 passed** w `tests/unit/test_incident_graph.py` i `tests/unit/test_incident_state.py` (12 + 14); Ruff lint **PASSED**, Ruff format **118 plików już sformatowanych**, Mypy strict **54 pliki, 0 błędów**. Testy obejmują m.in. synchronizację, deduplikację, konflikt ID, walidację powiązania z incydentem i serializację.
-- **Ostatnia potwierdzona pełna regresja:** **1456 passed, 0 failed** (2026-11-16; 22,57 s; `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1`, uruchomione testy PostgreSQL). Wykonana po dodaniu testów MCP Bootstrap/Executora i pierwszego grafu LangGraph.
-- **LangGraph:** według przebiegu prac dodano `langgraph==1.2.22` przez `uv`; zależność pojawiła się w `pyproject.toml` i `uv.lock`. Bez podłączonego LLM/MCP, trwałych checkpointów czy automatycznych retry w pierwszym grafie.
-- **Zachowane zabezpieczenia remediation/MCP:** wcześniejsze `apv:v2`, Guard, durable dispatch i kontrakt `SecureMcpExecutor` pozostają odrębną warstwą; rzeczywisty executor MCP i efekty zewnętrzne nadal **nie są** zaimplementowane.
+- **Obszar:** **Phase 2.0 — LangGraph Core**. Podetapy **2.0.1–2.0.3** zakończone i zapisane w Git; **2.0.4 — Investigation Planning & Workflow Routing** technicznie zakończony (implementacja, testy lokalne, pełna regresja), oczekuje na aktualizację dokumentacji i commit/push.
+- **Ostatni kamień milowy:** `InvestigationPlanSnapshot` w `IncidentState`, walidowany plan diagnostyczny, wstrzykiwany asynchroniczny planner (domyślnie deterministyczny) i routing wybierający `logs`, `metrics` albo obie gałęzie. Agregacja następuje po wykonaniu wybranych kolektorów.
+- **Stan orkiestracji:** `IncidentState` jest niezależny od domenowego `Incident`; przechowuje serializowalne snapshoty incydentu, dowodów i hipotez oraz opcjonalny `investigation_plan`. `merge_evidence()` deduplikuje po `evidence_id`, zapewnia deterministyczny porządek i odrzuca konflikty treści. Plan pozostaje polem *single-writer*, bez reducera.
+- **Weryfikacja Phase 2.0.4 (2026-11-16):** **42 passed** w dwóch plikach testowych stanu i grafu; Ruff lint **PASSED**, Ruff format **118 plików już sformatowanych**, Mypy strict **54 pliki, 0 błędów**. Przetestowano m.in. dobór źródeł, współbieżność, synchronizację, pojedynczą agregację, walidację planu i bezpieczne scalanie dowodów.
+- **Ostatnia potwierdzona pełna regresja:** **1472 passed, 0 failed** (2026-11-16; 44,49 s; `RUN_DB_APPROVAL_TESTS=1 RUN_DB_SCHEMA_TESTS=1`, z testami PostgreSQL). Wzrost o 16 testów względem ostatniej pełnej regresji 2.0.3 (**1456 passed**).
+- **LangGraph:** według przebiegu prac dodano wersję **1.2.22** przez `uv`; bez podłączonego LLM/MCP, trwałych checkpointów i automatycznych retry. Bieżący graf służy diagnostyce i nie wykonuje mutujących działań.
+- **Zachowane zabezpieczenia remediation/MCP:** `apv:v2`, Guard, durable dispatch i kontrakt `SecureMcpExecutor` pozostają odrębną warstwą; rzeczywisty executor MCP i efekty zewnętrzne nadal **nie są** zaimplementowane.
 - **PostgreSQL / Alembic:** ostatnio potwierdzony lokalny stan `e62b4f0c91ad (head)` — dopuszczono `apv:v1`/`apv:v2` w dwóch `CHECK`; 6 testów schematu zaliczonych (2026-11-15).
-- **Git (odczyt 2026-11-16):** `main...origin/main` bez wykazanego rozjazdu; **7 plików w stagingu**: `PROJECT_PROGRESS.md`, `pyproject.toml`, `uv.lock`, `orchestration/incident_state.py`, `orchestration/incident_graph.py` i dwa testy jednostkowe. `git diff --cached --check` bez uwag; nie potwierdzono jeszcze commita ani push. Ostatni commit/push odnotowany w starszym checkpointcie: `7d49058`; aktualnego `HEAD` nie potwierdzono osobnym poleceniem.
-- **Teraz:** zakończyć przegląd staged zmian (w szczególności `uv.lock`), następnie wykonać uzgodniony commit/push i zweryfikować synchronizację Git. Po tym kontynuować LangGraph Core, bez implementowania transportu MCP w tym kroku.
+- **Git:** Phase 2.0.3 zatwierdzony i wypchnięty jako **`592c5ef`** (`feat(orchestration): add initial parallel LangGraph incident workflow`); po push potwierdzono `main...origin/main` oraz czyste drzewo. **Stan Git po zmianach 2.0.4 nie został jeszcze ponownie sprawdzony** — nie zakładać stagingu, commita ani synchronizacji nowych zmian.
+- **Teraz:** zapisać ten kamień milowy w dokumentacji, sprawdzić rzeczywisty `git status` i diff 2.0.4, uzgodnić staging, commit/push i potwierdzić synchronizację. Następnie wybrać kolejny mały krok LangGraph Core na podstawie aktualnych pełnych plików, bez rozpoczynania transportu MCP.
 
 ## 2. Kluczowe decyzje i granice bezpieczeństwa
 
@@ -118,17 +118,26 @@
 - **2.0.2 — stan:** zaimplementowano `IncidentState` oparty na `TypedDict` / `Annotated`, serializowalne snapshoty danych domenowych oraz `merge_evidence()` deduplikujący po stabilnym `evidence_id` bez mutowania danych. Domena i jej reguły przejść nie zostały zmienione.
 - **2.0.3 — graf:** `START → intake → collect_logs || collect_metrics → aggregate_evidence → END`. Asynchroniczne wstrzykiwane kolektory, walidacja `incident_id`, oczekiwanie agregatora na obie gałęzie i scalanie dowodów przez reducer. Dane zewnętrzne, LLM, retry i trwałe checkpointy pozostają poza zakresem pierwszego grafu.
 - **Testy i typowanie:** **26 passed** (12 testów grafu + 14 stanu), Ruff lint/format **PASSED** (118 plików), Mypy strict **PASSED** (54 pliki, bez błędów). **Pełna regresja po zmianach: 1456 passed, 0 failed (2026-11-16, 22,57 s, z aktywnymi testami PostgreSQL).**
-- **Repozytorium:** 7 plików objętych stagingiem, w tym zależności, dwa nowe pliki orkiestracji, dwa testy i `PROJECT_PROGRESS.md`; `git diff --cached --check` bez uwag. Commit/push etapu niepotwierdzone.
+- **Repozytorium:** commit/push **`592c5ef`** na `main`/`origin/main` potwierdzony 2026-11-16; po zakończeniu 2.0.3 drzewo Git było czyste.
+
+
+### 2026-11-16 — Phase 2.0.4: Investigation Planning & Workflow Routing
+
+- **2.0.4.1 — kontrakt planu:** dodano `InvestigationPlanSnapshot` (`sources`, `rationale`) i `investigation_plan: InvestigationPlanSnapshot | None` do `IncidentState`; `initial_incident_state()` ustawia `None`. Walidacja odrzuca pusty plan, duplikaty i nieobsługiwane źródła; plan nie ma reducera (*single-writer*).
+- **2.0.4.2 — planner:** dodano node planowania oraz wstrzykiwany asynchroniczny `InvestigationPlanner`. Domyślny deterministyczny planner wybiera `logs` i `metrics`. Wyjście planera jest walidowane ponownie przed zebraniem dowodów; wejściowy snapshot incydentu pozostaje izolowany od zmian planera.
+- **2.0.4.3 — routing:** plan steruje wyborem `collect_logs`, `collect_metrics` albo obu kolektorów. Zmodyfikowano synchronizację tak, aby agregacja działała także dla jednej wybranej gałęzi i wykonywała się jednokrotnie. Przy dwóch źródłach zachowano równoległość i reducer `merge_evidence()`.
+- **Weryfikacja:** **42 passed** w testach stanu i grafu; Ruff lint **PASSED**, Ruff format **118 plików**, Mypy strict **54 pliki, 0 błędów**. **Pełna regresja: 1472 passed, 0 failed (2026-11-16, 44,49 s, z testami PostgreSQL).**
+- **Granice:** brak LLM, MCP, trwałych checkpointów, automatycznych retry i efektów mutujących. **Status Git tej grupy zmian do sprawdzenia przed commitem**.
 
 ## 4. Pozostały zakres i następny krok Phase 2.0
 
-**Zamknięcie 2.0.3 w repo:** lokalne testy grafu, Ruff, Mypy i pełna regresja PostgreSQL zakończone pomyślnie. Zmiany obejmujące 7 plików zostały dodane do stagingu; `uv lock --check` pomyślny, `git diff --cached --check` bez uwag. Pozostały końcowy przegląd zakresu zależności (`uv.lock`), commit i push. Nie utożsamiać wyników testów ani stagingu z commitem lub wdrożeniem.
+**Zamknięcie 2.0.4 w repo:** implementacja, testy grafu, Ruff, Mypy i pełna regresja PostgreSQL zakończone pomyślnie. Należy sprawdzić bieżący stan Git, przejrzeć diff (`incident_state.py`, `incident_graph.py`, testy i dokumentacja — rzeczywisty zakres ustalić przez `git status`), świadomie dodać zmiany do stagingu, wykonać commit/push i potwierdzić synchronizację `main`/`origin/main`. Nie utożsamiać zielonych testów z zapisaniem zmian w Git.
 
-**Dalszy LangGraph Core:** po uporządkowaniu 2.0.3 iteracyjnie rozbudować orkiestrację (plan analizy, routing, kolejne źródła dowodów i subgrafy), następnie checkpointing / durable execution, kontrolowaną obsługę błędów i retry, a w odpowiednim etapie `interrupt()` i bezpieczne wznowienie HITL. Kolejność i kontrakty następnych nodów zatwierdzić na podstawie aktualnych pełnych plików, nie domniemywać implementacji.
+**Dalszy LangGraph Core:** po zamknięciu 2.0.4 iteracyjnie rozwijać orkiestrację (kolejne źródła dowodów, subgrafy, checkpointing/durable execution oraz kontrolowana obsługa błędów i retry). `interrupt()` i bezpieczne wznowienie Human-in-the-Loop pozostają do wdrożenia we właściwym etapie. Kolejny zakres ustalić po analizie całych aktualnych plików; nie traktować planów jako implementacji.
 
 **Odłożone do właściwych faz:** bezpieczny executor MCP i gateway, pinning/integralność konfiguracji serwerów, resource preconditions, downstream idempotency i reconciliation `UNKNOWN`, klienci/serwery MCP, zaawansowany RAG, obserwowalność, CI/CD oraz wdrożenie. PostgreSQL nie gwarantuje exactly-once skutków zewnętrznych.
 
-**Dokumentacja:** zachować uczciwy opis ewolucji `apv:v1 → apv:v2` w README i `docs/adr/0001-mcp-bound-approval-policy-versioning.md`. `PROJECT_PROGRESS.md` aktualizować przy kamieniach milowych; `SESSION_HANDOFF.md` służy wznowieniu kontekstu, nie rejestrowaniu każdego drobnego kroku.
+**Dokumentacja:** zachować uczciwy opis ewolucji `apv:v1 → apv:v2` w README i `docs/adr/0001-mcp-bound-approval-policy-versioning.md`. `PROJECT_PROGRESS.md` aktualizować przy kamieniach milowych; `SESSION_HANDOFF.md` służy wznowieniu kontekstu, nie rejestrowaniu każdej drobnej zmiany.
 
 ## 5. Wznowienie pracy i zasady współpracy
 

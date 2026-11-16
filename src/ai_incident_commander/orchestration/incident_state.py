@@ -24,6 +24,34 @@ type WorkflowPhase = Literal[
 ]
 
 
+type InvestigationSource = Literal["logs", "metrics"]
+
+
+class InvestigationPlanSnapshot(TypedDict):
+    """Checkpoint-friendly, single-writer diagnostic plan."""
+
+    sources: list[InvestigationSource]
+    rationale: str
+
+
+def create_investigation_plan(
+    *, sources: list[InvestigationSource], rationale: str
+) -> InvestigationPlanSnapshot:
+    """Validate source selection before accepting a plan into graph state.
+
+    Keep the caller's source order and explanation; copy the mutable list.
+    """
+    if not sources:
+        raise ValueError("Investigation plan must include at least one source.")
+    if any(source not in ("logs", "metrics") for source in sources):
+        raise ValueError("Investigation plan contains an unsupported source.")
+    if len(set(sources)) != len(sources):
+        raise ValueError("Investigation plan sources must be unique.")
+    if not rationale.strip():
+        raise ValueError("Investigation plan rationale must not be blank.")
+    return InvestigationPlanSnapshot(sources=list(sources), rationale=rationale)
+
+
 class IncidentSnapshot(TypedDict):
     """Serialized incident information, not a mutable domain aggregate."""
 
@@ -104,6 +132,7 @@ class IncidentState(TypedDict):
 
     incident: IncidentSnapshot
     workflow_phase: WorkflowPhase
+    investigation_plan: InvestigationPlanSnapshot | None
     evidence: Annotated[list[EvidenceSnapshot], merge_evidence]
     hypotheses: list[HypothesisSnapshot]
 
@@ -165,6 +194,7 @@ def initial_incident_state(incident: Incident) -> IncidentState:
     return IncidentState(
         incident=snapshot_incident(incident),
         workflow_phase="intake",
+        investigation_plan=None,
         evidence=[],
         hypotheses=[],
     )

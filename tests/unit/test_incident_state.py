@@ -3,7 +3,7 @@
 import json
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Annotated, get_args, get_origin, get_type_hints
+from typing import Annotated, cast, get_args, get_origin, get_type_hints
 from uuid import UUID
 
 import pytest
@@ -14,6 +14,8 @@ from ai_incident_commander.domain.incident import Incident, IncidentSeverity
 from ai_incident_commander.orchestration.incident_state import (
     EvidenceSnapshotConflictError,
     IncidentState,
+    InvestigationSource,
+    create_investigation_plan,
     initial_incident_state,
     merge_evidence,
     snapshot_evidence,
@@ -72,6 +74,7 @@ def test_initial_state_preserves_incident_and_starts_without_findings() -> None:
     state = initial_incident_state(incident)
 
     assert state["workflow_phase"] == "intake"
+    assert state["investigation_plan"] is None
     assert state["incident"]["incident_id"] == str(incident.incident_id)
     assert state["incident"]["status"] == "reported"
     assert state["incident"]["severity"] == "sev2"
@@ -135,11 +138,43 @@ def test_all_snapshots_are_json_serializable() -> None:
     state = initial_incident_state(_incident())
     state["evidence"] = [snapshot_evidence(_evidence())]
     state["hypotheses"] = [snapshot_hypothesis(_hypothesis())]
+    state["investigation_plan"] = create_investigation_plan(
+        sources=["logs", "metrics"], rationale="Investigate API error rate."
+    )
 
     serialized = json.dumps(state, allow_nan=False)
     restored = json.loads(serialized)
 
     assert restored == state
+
+
+def test_investigation_plan_keeps_source_order_and_copies_input() -> None:
+    sources: list[InvestigationSource] = ["metrics", "logs"]
+    plan = create_investigation_plan(sources=sources, rationale="Check latency first.")
+    sources.clear()
+
+    assert plan == {"sources": ["metrics", "logs"], "rationale": "Check latency first."}
+
+
+def test_investigation_plan_rejects_empty_sources() -> None:
+    with pytest.raises(ValueError, match="at least one source"):
+        create_investigation_plan(sources=[], rationale="Investigate errors.")
+
+
+def test_investigation_plan_rejects_duplicate_sources() -> None:
+    with pytest.raises(ValueError, match="must be unique"):
+        create_investigation_plan(sources=["logs", "logs"], rationale="Investigate errors.")
+
+
+def test_investigation_plan_rejects_unknown_source_at_runtime() -> None:
+    unknown = cast("InvestigationSource", "deployments")
+    with pytest.raises(ValueError, match="unsupported source"):
+        create_investigation_plan(sources=[unknown], rationale="Investigate errors.")
+
+
+def test_investigation_plan_requires_nonblank_rationale() -> None:
+    with pytest.raises(ValueError, match="must not be blank"):
+        create_investigation_plan(sources=["logs"], rationale="  ")
 
 
 def test_parallel_evidence_merges_independent_of_completion_order() -> None:
@@ -201,3 +236,4 @@ def test_state_defines_evidence_reducer_but_not_hypothesis_reducer() -> None:
     assert get_origin(hints["evidence"]) is Annotated
     assert get_args(hints["evidence"])[1] is merge_evidence
     assert get_origin(hints["hypotheses"]) is list
+    assert get_origin(hints["investigation_plan"]) is not Annotated
