@@ -16,11 +16,13 @@ from ai_incident_commander.domain.incident import Incident
 from ai_incident_commander.orchestration.incident_graph import (
     EvidenceCollector,
     IncidentGraph,
+    baseline_investigation_planner,
     build_incident_graph,
 )
 from ai_incident_commander.orchestration.incident_state import (
     IncidentSnapshot,
     IncidentState,
+    InvestigationPlanSnapshot,
     initial_incident_state,
 )
 
@@ -142,5 +144,73 @@ def test_checkpointer_requires_thread_id_for_invocation() -> None:
         graph = _graph(InMemorySaver())
         with pytest.raises(ValueError, match="thread_id"):
             await graph.ainvoke(_state())
+
+    asyncio.run(scenario())
+
+
+def test_resume_failed_metrics_preserves_successful_parallel_work() -> None:
+    """Resume a nested investigation without repeating completed sibling work.
+
+    The first invocation fails in metrics after logs finishes. A second graph
+    instance with the same saver and thread_id explicitly resumes the run.
+    """
+
+    async def scenario() -> None:
+        saver = InMemorySaver()
+        config: RunnableConfig = {"configurable": {"thread_id": "run-failed-metrics-resume"}}
+        calls = {"planner": 0, "logs": 0, "metrics": 0}
+        logs_finished = asyncio.Event()
+        log_collector = _collector(EvidenceType.LOG, 1)
+        metric_collector = _collector(EvidenceType.METRIC, 2)
+
+        async def planner(incident: IncidentSnapshot) -> InvestigationPlanSnapshot:
+            calls["planner"] += 1
+            return await baseline_investigation_planner(incident)
+
+        async def logs(incident: IncidentSnapshot) -> list[Evidence]:
+            calls["logs"] += 1
+            result = await log_collector(incident)
+            logs_finished.set()
+            return result
+
+        async def metrics(incident: IncidentSnapshot) -> list[Evidence]:
+            calls["metrics"] += 1
+            if calls["metrics"] == 1:
+                await logs_finished.wait()
+                # Allow the successful sibling to return before raising.
+                await asyncio.sleep(0.05)
+                raise RuntimeError("transient metrics failure")
+            return await metric_collector(incident)
+
+        def make_graph() -> IncidentGraph:
+            return build_incident_graph(
+                collect_logs=logs,
+                collect_metrics=metrics,
+                investigation_planner=planner,
+                checkpointer=saver,
+            )
+
+        original = make_graph()
+        with pytest.raises(RuntimeError, match="transient metrics failure"):
+            await original.ainvoke(_state(), config=config, durability="sync")
+
+        failed = await original.aget_state(config)
+        assert failed.next  # The parent graph has not finished.
+        assert calls == {"planner": 1, "logs": 1, "metrics": 1}
+
+        # This is resume, not a fresh call with initial state.
+        resumed = make_graph()
+        result = await resumed.ainvoke(None, config=config, durability="sync")
+        final = await resumed.aget_state(config)
+
+        assert result["workflow_phase"] == "analyzing"
+        assert {item["evidence_id"] for item in result["evidence"]} == {
+            str(UUID(int=1)),
+            str(UUID(int=2)),
+        }
+        assert len(result["evidence"]) == 2
+        assert final.next == ()
+        assert dict(final.values) == result
+        assert calls == {"planner": 1, "logs": 1, "metrics": 2}
 
     asyncio.run(scenario())
