@@ -35,3 +35,13 @@ coverage.xml
 # Operating system files
 .DS_Store
 Thumbs.db
+
+# ============================================
+# Local project documentation
+# ============================================
+
+# Keep Markdown documentation local
+*.md
+
+# Publish only the root README
+!/README.md

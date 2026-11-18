@@ -1,6 +1,6 @@
 """Application composition root for the remediation approval workflow."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -27,7 +27,7 @@ async def approval_service_lifespan(
     *,
     authorizer: ApprovalAuthorizer,
     config: DatabaseConfig | None = None,
-) -> AsyncIterator[ApprovalApplicationService]:
+) -> AsyncGenerator[ApprovalApplicationService]:
     """Wire approvals once per process lifecycle and dispose the owned engine.
 
     Do not enter this context for each request. An authentication/authorization
@@ -64,7 +64,7 @@ async def approval_workflow_lifespan(
     resolver: TargetResolver,
     validity_period: timedelta,
     config: DatabaseConfig | None = None,
-) -> AsyncIterator[ApprovalServices]:
+) -> AsyncGenerator[ApprovalServices]:
     """Retain the legacy, catalog-only approval workflow for non-MCP callers.
 
     Do NOT wire a mutating MCP executor with these unbound services.
@@ -119,7 +119,7 @@ async def mcp_approval_workflow_lifespan(
     validity_period: timedelta,
     mcp_bindings: TrustedMcpActionBindings,
     config: DatabaseConfig | None = None,
-) -> AsyncIterator[McpApprovalServices]:
+) -> AsyncGenerator[McpApprovalServices]:
     """Wire MCP-bound requests and Guard with identical trusted bindings.
 
     This explicit entry point never falls back to apv:v1. The caller must load

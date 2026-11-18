@@ -2,11 +2,13 @@
 
 The coordinator owns incident intake. Planning, conditional fan-out, collection,
 and evidence aggregation belong to the narrower Investigator subgraph.
-No LLM, MCP transport, checkpointer, mutating actions, or retries are used.
+No LLM, MCP transport, mutating actions, or retries are used.
+Checkpointing is optional and owned by the caller.
 """
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -45,11 +47,16 @@ def build_incident_graph(
     collect_logs: EvidenceCollector,
     collect_metrics: EvidenceCollector,
     investigation_planner: InvestigationPlanner = baseline_investigation_planner,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> IncidentGraph:
     """Compile intake -> Investigator subgraph, preserving the public builder API.
 
     Both state schemas share diagnostic channels. In particular, their evidence
     reducer deduplicates the final subgraph snapshot when the parent receives it.
+
+    An optional, caller-owned checkpointer persists coordinator steps. The
+    Investigator subgraph inherits it; no saver is constructed in this builder.
+    Invocations using a saver must supply a unique run-specific thread_id.
     """
 
     def intake(state: IncidentState) -> IncidentStateUpdate:
@@ -76,4 +83,4 @@ def build_incident_graph(
     builder.add_edge(START, "intake")
     builder.add_edge("intake", "investigator")
     builder.add_edge("investigator", END)
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
