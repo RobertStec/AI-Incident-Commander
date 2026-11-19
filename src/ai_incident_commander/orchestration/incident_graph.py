@@ -2,7 +2,7 @@
 
 The coordinator owns incident intake. Planning, conditional fan-out, collection,
 and evidence aggregation belong to the narrower Investigator subgraph.
-No LLM, MCP transport, mutating actions, or retries are used.
+No LLM, MCP transport, or mutating actions are used.
 Checkpointing is optional and owned by the caller.
 """
 
@@ -11,7 +11,7 @@ from typing import Any, TypedDict, cast
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import interrupt
+from langgraph.types import RetryPolicy, interrupt
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from ai_incident_commander.orchestration.incident_state import (
@@ -34,6 +34,9 @@ from ai_incident_commander.orchestration.investigator_graph import (
 )
 from ai_incident_commander.orchestration.investigator_graph import (
     EvidenceIncidentMismatchError as EvidenceIncidentMismatchError,
+)
+from ai_incident_commander.orchestration.investigator_graph import (
+    TransientEvidenceCollectionError as TransientEvidenceCollectionError,
 )
 
 type IncidentGraph = CompiledStateGraph[IncidentState, None, IncidentState, IncidentState]
@@ -84,6 +87,7 @@ def build_incident_graph(
     investigation_planner: InvestigationPlanner = baseline_investigation_planner,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     enable_analysis_review: bool = False,
+    collector_retry_policy: RetryPolicy | None = None,
 ) -> IncidentGraph:
     """Compile intake -> Investigator subgraph, preserving the public builder API.
 
@@ -95,6 +99,8 @@ def build_incident_graph(
     Invocations using a saver must supply a unique run-specific thread_id.
     HITL is opt-in, requires a checkpointer, and must retain the same topology
     when the interrupted thread is later resumed. It is not remediation approval.
+    The optional collector retry policy is passed to the read-only Investigator
+    nodes; the coordinator, planner, and review are never retried automatically.
     """
     if enable_analysis_review and checkpointer is None:
         raise ValueError("Analysis review requires a checkpointer.")
@@ -127,6 +133,7 @@ def build_incident_graph(
         collect_logs=collect_logs,
         collect_metrics=collect_metrics,
         investigation_planner=investigation_planner,
+        collector_retry_policy=collector_retry_policy,
     )
 
     builder: StateGraph[IncidentState, None, IncidentState, IncidentState] = StateGraph(

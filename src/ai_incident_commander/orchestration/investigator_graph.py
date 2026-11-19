@@ -2,7 +2,7 @@
 
 The subgraph accepts an InvestigatorState in the planning phase. When nested
 in the main Incident Graph, the coordinator owns intake and downstream state.
-No LLM, MCP transport, checkpointer, retries, or mutating actions are used.
+No LLM, MCP transport, standalone checkpointer, or mutating actions are used.
 """
 
 from collections.abc import Awaitable, Callable
@@ -11,6 +11,7 @@ from typing import Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import RetryPolicy
 
 from ai_incident_commander.domain.evidence import Evidence
 from ai_incident_commander.orchestration.incident_state import (
@@ -36,6 +37,15 @@ type CollectorNode = Literal["collect_logs", "collect_metrics"]
 
 class EvidenceIncidentMismatchError(ValueError):
     """A collector returned evidence belonging to a different incident."""
+
+
+class TransientEvidenceCollectionError(RuntimeError):
+    """A read-only evidence source failed transiently and may be retried.
+
+    Source adapters should raise this only for operations known to be safe to
+    repeat (for example, a failed read-only metrics request). Permanent errors,
+    incorrect evidence and invalid plans must not be wrapped in this exception.
+    """
 
 
 class InvestigatorStateUpdate(TypedDict, total=False):
@@ -74,11 +84,14 @@ def build_investigator_graph(
     collect_logs: EvidenceCollector,
     collect_metrics: EvidenceCollector,
     investigation_planner: InvestigationPlanner = baseline_investigation_planner,
+    collector_retry_policy: RetryPolicy | None = None,
 ) -> InvestigatorGraph:
     """Compile planning -> selected collectors -> deferred aggregation.
 
     Input must be in `planning` with no pre-existing plan. The parent graph
-    will be responsible for the intake transition when composed in 2.0.5.3.
+    owns the intake transition. Retry is opt-in and applies only to the
+    read-only collector nodes. The caller must provide a narrowly classified
+    RetryPolicy; planning and validation errors must not be retried.
     """
 
     async def plan_investigation(state: InvestigatorState) -> InvestigatorStateUpdate:
@@ -128,8 +141,8 @@ def build_investigator_graph(
         InvestigatorState
     )
     builder.add_node("investigation_planner", plan_investigation)
-    builder.add_node("collect_logs", logs_node)
-    builder.add_node("collect_metrics", metrics_node)
+    builder.add_node("collect_logs", logs_node, retry_policy=collector_retry_policy)
+    builder.add_node("collect_metrics", metrics_node, retry_policy=collector_retry_policy)
     builder.add_node("aggregate_evidence", aggregate_evidence, defer=True)
 
     builder.add_edge(START, "investigation_planner")

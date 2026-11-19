@@ -8,6 +8,7 @@ from typing import cast
 from uuid import UUID
 
 import pytest
+from langgraph.types import RetryPolicy
 
 from ai_incident_commander.domain.evidence import Evidence, EvidenceType
 from ai_incident_commander.domain.incident import Incident
@@ -24,6 +25,7 @@ from ai_incident_commander.orchestration.investigator_graph import (
     EvidenceCollector,
     EvidenceIncidentMismatchError,
     InvestigationPlanner,
+    TransientEvidenceCollectionError,
     build_investigator_graph,
 )
 
@@ -304,3 +306,121 @@ def test_subgraph_isolates_incident_snapshot_from_injected_dependencies() -> Non
 
     assert result["incident"] == original["incident"]
     assert state == original
+
+
+def _retry_transient_reads() -> RetryPolicy:
+    """Explicitly retry only classified transient read-only source failures."""
+    return RetryPolicy(
+        max_attempts=3,
+        initial_interval=0.001,
+        max_interval=0.01,
+        backoff_factor=2.0,
+        jitter=False,
+        retry_on=TransientEvidenceCollectionError,
+    )
+
+
+def test_transient_collector_failure_retries_only_selected_source() -> None:
+    attempts = {"logs": 0, "metrics": 0}
+
+    async def logs(_incident: IncidentSnapshot) -> list[Evidence]:
+        attempts["logs"] += 1
+        if attempts["logs"] < 3:
+            raise TransientEvidenceCollectionError("Transient observability read failure")
+        return [_observation(1)]
+
+    async def metrics(_incident: IncidentSnapshot) -> list[Evidence]:
+        attempts["metrics"] += 1
+        raise AssertionError("Metrics were not selected")
+
+    graph = build_investigator_graph(
+        collect_logs=logs,
+        collect_metrics=metrics,
+        investigation_planner=_planner("logs"),
+        collector_retry_policy=_retry_transient_reads(),
+    )
+    result = asyncio.run(graph.ainvoke(_state()))
+
+    assert attempts == {"logs": 3, "metrics": 0}
+    assert result["workflow_phase"] == "analyzing"
+    assert [item["evidence_id"] for item in result["evidence"]] == [str(UUID(int=1))]
+
+
+def test_permanent_collector_failure_is_not_retried() -> None:
+    attempts = 0
+
+    async def permanent(_incident: IncidentSnapshot) -> list[Evidence]:
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("Permanent source configuration error")
+
+    graph = build_investigator_graph(
+        collect_logs=permanent,
+        collect_metrics=_collector(),
+        investigation_planner=_planner("logs"),
+        collector_retry_policy=_retry_transient_reads(),
+    )
+    with pytest.raises(ValueError, match="Permanent source configuration error"):
+        asyncio.run(graph.ainvoke(_state()))
+
+    assert attempts == 1
+
+
+def test_transient_collector_failure_propagates_after_bounded_attempts() -> None:
+    attempts = 0
+
+    async def unavailable(_incident: IncidentSnapshot) -> list[Evidence]:
+        nonlocal attempts
+        attempts += 1
+        raise TransientEvidenceCollectionError("Observability still unavailable")
+
+    graph = build_investigator_graph(
+        collect_logs=unavailable,
+        collect_metrics=_collector(),
+        investigation_planner=_planner("logs"),
+        collector_retry_policy=_retry_transient_reads(),
+    )
+    with pytest.raises(TransientEvidenceCollectionError, match="still unavailable"):
+        asyncio.run(graph.ainvoke(_state()))
+
+    assert attempts == 3
+
+
+def test_wrong_incident_evidence_is_not_retried() -> None:
+    attempts = 0
+
+    async def foreign(_incident: IncidentSnapshot) -> list[Evidence]:
+        nonlocal attempts
+        attempts += 1
+        return [_observation(1, incident_id=UUID(int=999))]
+
+    graph = build_investigator_graph(
+        collect_logs=foreign,
+        collect_metrics=_collector(),
+        investigation_planner=_planner("logs"),
+        collector_retry_policy=_retry_transient_reads(),
+    )
+    with pytest.raises(EvidenceIncidentMismatchError, match="different incident"):
+        asyncio.run(graph.ainvoke(_state()))
+
+    assert attempts == 1
+
+
+def test_planner_is_not_retried_even_when_raising_transient_collector_error() -> None:
+    attempts = 0
+
+    async def planner(_incident: IncidentSnapshot) -> InvestigationPlanSnapshot:
+        nonlocal attempts
+        attempts += 1
+        raise TransientEvidenceCollectionError("Planner must not inherit collector retry")
+
+    graph = build_investigator_graph(
+        collect_logs=_collector(),
+        collect_metrics=_collector(),
+        investigation_planner=planner,
+        collector_retry_policy=_retry_transient_reads(),
+    )
+    with pytest.raises(TransientEvidenceCollectionError, match="Planner must not"):
+        asyncio.run(graph.ainvoke(_state()))
+
+    assert attempts == 1

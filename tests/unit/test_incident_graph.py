@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START
-from langgraph.types import Command
+from langgraph.types import Command, RetryPolicy
 
 from ai_incident_commander.domain.evidence import Evidence, EvidenceType
 from ai_incident_commander.domain.hypothesis import Hypothesis
@@ -19,6 +19,7 @@ from ai_incident_commander.orchestration.incident_graph import (
     EvidenceCollector,
     EvidenceIncidentMismatchError,
     InvestigationPlanner,
+    TransientEvidenceCollectionError,
     build_incident_graph,
 )
 from ai_incident_commander.orchestration.incident_state import (
@@ -643,3 +644,43 @@ def test_analysis_review_rejects_untrusted_resume_without_persisting_decision(
         assert snapshot.next == ("analysis_review",)
 
     asyncio.run(scenario())
+
+
+def test_coordinator_propagates_retry_policy_to_investigator_collectors() -> None:
+    """Production parent must configure the nested read-only source nodes."""
+    calls = {"planner": 0, "logs": 0, "metrics": 0}
+
+    async def planner(_incident: IncidentSnapshot) -> InvestigationPlanSnapshot:
+        calls["planner"] += 1
+        return InvestigationPlanSnapshot(
+            sources=["logs", "metrics"], rationale="Investigate both sources."
+        )
+
+    async def logs(_incident: IncidentSnapshot) -> list[Evidence]:
+        calls["logs"] += 1
+        if calls["logs"] == 1:
+            raise TransientEvidenceCollectionError("Temporary read timeout")
+        return [_observation(1)]
+
+    async def metrics(_incident: IncidentSnapshot) -> list[Evidence]:
+        calls["metrics"] += 1
+        return [_observation(2, evidence_type=EvidenceType.METRIC)]
+
+    graph = build_incident_graph(
+        collect_logs=logs,
+        collect_metrics=metrics,
+        investigation_planner=planner,
+        collector_retry_policy=RetryPolicy(
+            max_attempts=3,
+            initial_interval=0.001,
+            max_interval=0.01,
+            backoff_factor=2.0,
+            jitter=False,
+            retry_on=TransientEvidenceCollectionError,
+        ),
+    )
+    result = asyncio.run(graph.ainvoke(_state()))
+
+    assert calls == {"planner": 1, "logs": 2, "metrics": 1}
+    assert result["workflow_phase"] == "analyzing"
+    assert len(result["evidence"]) == 2
