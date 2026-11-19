@@ -15,6 +15,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
+from langgraph.types import Command
 from psycopg import AsyncConnection
 
 from ai_incident_commander.application.checkpoint_bootstrap import (
@@ -515,6 +516,221 @@ def test_inflight_collector_recovers_after_sigkill(tmp_path: Path) -> None:
                 if child.returncode is None:
                     child.kill()
                 await asyncio.wait_for(child.communicate(), timeout=10)
+            async with postgres_checkpoint_lifespan(config=config) as saver:
+                await saver.adelete_thread(thread_id)
+
+    asyncio.run(scenario())
+
+
+def test_analysis_review_survives_independent_postgres_lifespans() -> None:
+    """Persist a real HITL interrupt and resume it without replaying investigation."""
+    config = _local_checkpoint_config()
+    thread_id = _thread_id()
+    run_config = {"configurable": {"thread_id": thread_id}}
+    incident = _incident()
+    calls = {"planner": 0, "logs": 0, "metrics": 0}
+    expected_review = {
+        "outcome": "needs_follow_up",
+        "note": "Inspect the most recent deployment before remediation.",
+    }
+
+    async def planner(_snapshot: IncidentSnapshot) -> InvestigationPlanSnapshot:
+        calls["planner"] += 1
+        return create_investigation_plan(
+            sources=["logs", "metrics"],
+            rationale="Collect diagnostics for human analysis review.",
+        )
+
+    async def logs(snapshot: IncidentSnapshot) -> list[Evidence]:
+        calls["logs"] += 1
+        return await _logs(snapshot)
+
+    async def metrics(snapshot: IncidentSnapshot) -> list[Evidence]:
+        calls["metrics"] += 1
+        return await _metrics(snapshot)
+
+    async def scenario() -> None:
+        await _assert_prepared_checkpoint_schema(config)
+        try:
+            # Lifecycle A: the actual parent + Investigator reaches a persisted HITL interrupt.
+            async with postgres_checkpoint_lifespan(config=config) as saver:
+                graph = build_incident_graph(
+                    collect_logs=logs,
+                    collect_metrics=metrics,
+                    investigation_planner=planner,
+                    checkpointer=saver,
+                    enable_analysis_review=True,
+                )
+                interrupted = await graph.ainvoke(
+                    initial_incident_state(incident), config=run_config, durability="sync"
+                )
+                assert "__interrupt__" in interrupted
+                assert len(interrupted["__interrupt__"]) == 1
+                request = interrupted["__interrupt__"][0].value
+                assert request == {
+                    "kind": "analysis_review",
+                    "incident_id": str(incident.incident_id),
+                    "evidence_count": 1,
+                    "allowed_outcomes": ["acknowledged", "needs_follow_up"],
+                }
+                paused = await graph.aget_state(run_config)
+                assert paused.next == ("analysis_review",)
+                assert paused.values["workflow_phase"] == "analyzing"
+                assert paused.values.get("analysis_review") is None
+                assert len(paused.values["evidence"]) == 1
+                evidence_before_resume = paused.values["evidence"]
+                assert calls == {"planner": 1, "logs": 1, "metrics": 1}
+
+            # Lifecycle B: fresh connection and compiled graph, same topology and thread.
+            async with postgres_checkpoint_lifespan(config=config) as saver:
+                graph = build_incident_graph(
+                    collect_logs=logs,
+                    collect_metrics=metrics,
+                    investigation_planner=planner,
+                    checkpointer=saver,
+                    enable_analysis_review=True,
+                )
+                restored = await graph.aget_state(run_config)
+                assert restored.next == ("analysis_review",)
+                assert restored.values["incident"]["incident_id"] == str(incident.incident_id)
+                assert restored.values["evidence"] == evidence_before_resume
+                assert restored.values.get("analysis_review") is None
+                assert len(restored.tasks) == 1
+                assert restored.tasks[0].interrupts[0].value == request
+
+                result = await graph.ainvoke(
+                    Command(
+                        resume={
+                            "outcome": "needs_follow_up",
+                            "note": "  Inspect the most recent deployment before remediation.  ",
+                        }
+                    ),
+                    config=run_config,
+                    durability="sync",
+                )
+                finished = await graph.aget_state(run_config)
+                assert finished.next == ()
+                assert result["analysis_review"] == expected_review
+                assert finished.values["analysis_review"] == expected_review
+                assert finished.values["workflow_phase"] == "analyzing"
+                assert finished.values["evidence"] == evidence_before_resume
+                assert finished.values["hypotheses"] == []
+                assert calls == {"planner": 1, "logs": 1, "metrics": 1}
+        finally:
+            # The checkpointer does not own any other thread or database objects.
+            async with postgres_checkpoint_lifespan(config=config) as saver:
+                await saver.adelete_thread(thread_id)
+
+    asyncio.run(scenario())
+
+
+def test_rejected_analysis_review_resume_can_be_corrected_across_postgres_lifespans() -> None:
+    """An invalid HITL reply must not consume the pending operator review."""
+    config = _local_checkpoint_config()
+    thread_id = _thread_id()
+    run_config = {"configurable": {"thread_id": thread_id}}
+    incident = _incident()
+    calls = {"planner": 0, "logs": 0, "metrics": 0}
+    accepted_review = {
+        "outcome": "needs_follow_up",
+        "note": "Inspect deployment changes before remediation.",
+    }
+
+    async def planner(_snapshot: IncidentSnapshot) -> InvestigationPlanSnapshot:
+        calls["planner"] += 1
+        return create_investigation_plan(
+            sources=["logs", "metrics"],
+            rationale="Collect diagnostics before an operator reviews the incident.",
+        )
+
+    async def logs(snapshot: IncidentSnapshot) -> list[Evidence]:
+        calls["logs"] += 1
+        return await _logs(snapshot)
+
+    async def metrics(snapshot: IncidentSnapshot) -> list[Evidence]:
+        calls["metrics"] += 1
+        return await _metrics(snapshot)
+
+    async def scenario() -> None:
+        await _assert_prepared_checkpoint_schema(config)
+        try:
+            # Lifespan A: persist the review interrupt after completing diagnostics.
+            async with postgres_checkpoint_lifespan(config=config) as saver:
+                graph = build_incident_graph(
+                    collect_logs=logs,
+                    collect_metrics=metrics,
+                    investigation_planner=planner,
+                    checkpointer=saver,
+                    enable_analysis_review=True,
+                )
+                interrupted = await graph.ainvoke(
+                    initial_incident_state(incident),
+                    config=run_config,
+                    durability="sync",
+                )
+                assert len(interrupted["__interrupt__"]) == 1
+                paused = await graph.aget_state(run_config)
+                assert paused.next == ("analysis_review",)
+                assert paused.values.get("analysis_review") is None
+                evidence_before = paused.values["evidence"]
+                assert len(evidence_before) == 1
+                assert calls == {"planner": 1, "logs": 1, "metrics": 1}
+
+            # Lifespan B: untrusted input cannot smuggle remediation approval.
+            async with postgres_checkpoint_lifespan(config=config) as saver:
+                graph = build_incident_graph(
+                    collect_logs=logs,
+                    collect_metrics=metrics,
+                    investigation_planner=planner,
+                    checkpointer=saver,
+                    enable_analysis_review=True,
+                )
+                with pytest.raises(ValueError, match="invalid fields"):
+                    await graph.ainvoke(
+                        Command(resume={"outcome": "acknowledged", "approved": True}),
+                        config=run_config,
+                        durability="sync",
+                    )
+                failed = await graph.aget_state(run_config)
+                assert failed.next == ("analysis_review",)
+                assert failed.values["incident"]["incident_id"] == str(incident.incident_id)
+                assert failed.values.get("analysis_review") is None
+                assert failed.values["evidence"] == evidence_before
+                assert calls == {"planner": 1, "logs": 1, "metrics": 1}
+
+            # Lifespan C: a corrected reply must complete the *same* pending thread.
+            async with postgres_checkpoint_lifespan(config=config) as saver:
+                graph = build_incident_graph(
+                    collect_logs=logs,
+                    collect_metrics=metrics,
+                    investigation_planner=planner,
+                    checkpointer=saver,
+                    enable_analysis_review=True,
+                )
+                restored = await graph.aget_state(run_config)
+                assert restored.next == ("analysis_review",)
+                assert restored.values.get("analysis_review") is None
+                result = await graph.ainvoke(
+                    Command(
+                        resume={
+                            "outcome": "needs_follow_up",
+                            "note": "  Inspect deployment changes before remediation.  ",
+                        }
+                    ),
+                    config=run_config,
+                    durability="sync",
+                )
+                completed = await graph.aget_state(run_config)
+                assert completed.next == ()
+                assert result["analysis_review"] == accepted_review
+                assert completed.values["analysis_review"] == accepted_review
+                assert completed.values["workflow_phase"] == "analyzing"
+                assert completed.values["incident"]["incident_id"] == str(incident.incident_id)
+                assert completed.values["evidence"] == evidence_before
+                assert completed.values["hypotheses"] == []
+                assert calls == {"planner": 1, "logs": 1, "metrics": 1}
+        finally:
+            # No DDL or table-wide cleanup: delete only this test-owned thread.
             async with postgres_checkpoint_lifespan(config=config) as saver:
                 await saver.adelete_thread(thread_id)
 

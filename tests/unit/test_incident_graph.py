@@ -5,10 +5,12 @@ import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START
+from langgraph.types import Command
 
 from ai_incident_commander.domain.evidence import Evidence, EvidenceType
 from ai_incident_commander.domain.hypothesis import Hypothesis
@@ -520,3 +522,124 @@ def test_parent_stream_emits_one_subgraph_completion_after_aggregation() -> None
     assert child.count("collect_metrics") == 1
     assert child.count("aggregate_evidence") == 1
     assert child[-1] == "aggregate_evidence"
+
+
+# Phase 2.0.7.2: opt-in human review is diagnostic feedback, not authorization.
+
+
+def test_analysis_review_requires_checkpointer_when_enabled() -> None:
+    with pytest.raises(ValueError, match="requires a checkpointer"):
+        build_incident_graph(
+            collect_logs=_collector(),
+            collect_metrics=_collector(),
+            enable_analysis_review=True,
+        )
+
+
+def test_analysis_review_adds_only_one_optional_parent_node() -> None:
+    graph = build_incident_graph(
+        collect_logs=_collector(),
+        collect_metrics=_collector(),
+        enable_analysis_review=True,
+        checkpointer=InMemorySaver(),
+    )
+    assert set(graph.get_graph().nodes) == {START, "intake", "investigator", "analysis_review", END}
+    assert "collect_logs" not in graph.get_graph().nodes
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ({"outcome": "acknowledged"}, {"outcome": "acknowledged", "note": None}),
+        (
+            {"outcome": "needs_follow_up", "note": "  Check recent deployments.  "},
+            {"outcome": "needs_follow_up", "note": "Check recent deployments."},
+        ),
+    ],
+)
+def test_analysis_review_interrupts_then_resumes_without_recollecting_evidence(
+    reply: dict[str, str], expected: dict[str, str | None]
+) -> None:
+    async def scenario() -> None:
+        calls = {"logs": 0, "metrics": 0}
+
+        async def logs(_incident: IncidentSnapshot) -> list[Evidence]:
+            calls["logs"] += 1
+            return [_observation(1)]
+
+        async def metrics(_incident: IncidentSnapshot) -> list[Evidence]:
+            calls["metrics"] += 1
+            return [_observation(2, evidence_type=EvidenceType.METRIC)]
+
+        saver = InMemorySaver()
+        config = {"configurable": {"thread_id": f"analysis-review-{uuid4()}"}}
+        graph = build_incident_graph(
+            collect_logs=logs,
+            collect_metrics=metrics,
+            enable_analysis_review=True,
+            checkpointer=saver,
+        )
+        interrupted = await graph.ainvoke(_state(), config=config)
+        assert "__interrupt__" in interrupted
+        assert len(interrupted["__interrupt__"]) == 1
+        request = interrupted["__interrupt__"][0].value
+        assert request == {
+            "kind": "analysis_review",
+            "incident_id": str(_INCIDENT_ID),
+            "evidence_count": 2,
+            "allowed_outcomes": ["acknowledged", "needs_follow_up"],
+        }
+        assert json.loads(json.dumps(request, allow_nan=False)) == request
+        paused = await graph.aget_state(config)
+        assert paused.next == ("analysis_review",)
+        assert paused.values.get("analysis_review") is None
+        assert paused.values["workflow_phase"] == "analyzing"
+        assert calls == {"logs": 1, "metrics": 1}
+
+        # Recompile with the same topology and saver to represent a new request.
+        resumed_graph = build_incident_graph(
+            collect_logs=logs,
+            collect_metrics=metrics,
+            enable_analysis_review=True,
+            checkpointer=saver,
+        )
+        completed = await resumed_graph.ainvoke(Command(resume=reply), config=config)
+        final = await resumed_graph.aget_state(config)
+        assert final.next == ()
+        assert completed["analysis_review"] == expected
+        assert final.values["analysis_review"] == expected
+        assert completed["workflow_phase"] == "analyzing"
+        assert calls == {"logs": 1, "metrics": 1}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [
+        ("acknowledged", "must be an object"),
+        ({"approved": True}, "invalid fields"),
+        ({"outcome": "acknowledged", "approved": True}, "invalid fields"),
+        ({"outcome": "approved"}, "Unsupported analysis review outcome"),
+        ({"outcome": "needs_follow_up"}, "requires a note"),
+    ],
+)
+def test_analysis_review_rejects_untrusted_resume_without_persisting_decision(
+    reply: object, message: str
+) -> None:
+    async def scenario() -> None:
+        config = {"configurable": {"thread_id": f"analysis-review-invalid-{uuid4()}"}}
+        graph = build_incident_graph(
+            collect_logs=_collector(),
+            collect_metrics=_collector(),
+            checkpointer=InMemorySaver(),
+            enable_analysis_review=True,
+        )
+        await graph.ainvoke(_state(), config=config)
+        with pytest.raises(ValueError, match=message):
+            await graph.ainvoke(Command(resume=reply), config=config)
+        snapshot = await graph.aget_state(config)
+        assert snapshot.values.get("analysis_review") is None
+        assert snapshot.next == ("analysis_review",)
+
+    asyncio.run(scenario())

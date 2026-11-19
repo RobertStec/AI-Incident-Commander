@@ -3,7 +3,7 @@
 import json
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Annotated, cast, get_args, get_origin, get_type_hints
+from typing import Annotated, NotRequired, cast, get_args, get_origin, get_type_hints
 from uuid import UUID
 
 import pytest
@@ -12,10 +12,12 @@ from ai_incident_commander.domain.evidence import Evidence, EvidenceType
 from ai_incident_commander.domain.hypothesis import Hypothesis
 from ai_incident_commander.domain.incident import Incident, IncidentSeverity
 from ai_incident_commander.orchestration.incident_state import (
+    AnalysisReviewOutcome,
     EvidenceSnapshotConflictError,
     IncidentState,
     InvestigationSource,
     InvestigatorState,
+    create_analysis_review,
     create_investigation_plan,
     initial_incident_state,
     merge_evidence,
@@ -82,6 +84,7 @@ def test_initial_state_preserves_incident_and_starts_without_findings() -> None:
     assert state["incident"]["affected_services"] == ["payments-api", "checkout-api"]
     assert state["evidence"] == []
     assert state["hypotheses"] == []
+    assert state["analysis_review"] is None
 
 
 def test_incident_snapshot_preserves_timestamps_and_optional_fields() -> None:
@@ -142,6 +145,9 @@ def test_all_snapshots_are_json_serializable() -> None:
     state["investigation_plan"] = create_investigation_plan(
         sources=["logs", "metrics"], rationale="Investigate API error rate."
     )
+    state["analysis_review"] = create_analysis_review(
+        outcome="needs_follow_up", note="Investigate the latest deployment."
+    )
 
     serialized = json.dumps(state, allow_nan=False)
     restored = json.loads(serialized)
@@ -176,6 +182,69 @@ def test_investigation_plan_rejects_unknown_source_at_runtime() -> None:
 def test_investigation_plan_requires_nonblank_rationale() -> None:
     with pytest.raises(ValueError, match="must not be blank"):
         create_investigation_plan(sources=["logs"], rationale="  ")
+
+
+def test_analysis_review_acknowledgement_does_not_require_a_note() -> None:
+    review = create_analysis_review(outcome="acknowledged")
+
+    assert review == {"outcome": "acknowledged", "note": None}
+    assert "approved" not in review  # Review does not grant remediation authorization.
+
+
+def test_analysis_review_follow_up_requires_a_note() -> None:
+    with pytest.raises(ValueError, match="requires a note"):
+        create_analysis_review(outcome="needs_follow_up")
+
+
+def test_analysis_review_normalizes_notes_for_both_outcomes() -> None:
+    for outcome in ("acknowledged", "needs_follow_up"):
+        review = create_analysis_review(outcome=outcome, note="  Check deployment diff.  ")
+
+        assert review == {"outcome": outcome, "note": "Check deployment diff."}
+
+
+@pytest.mark.parametrize("outcome", ["approved", "rejected", "unknown"])
+def test_analysis_review_rejects_unsupported_outcomes(outcome: str) -> None:
+    invalid_outcome = cast("AnalysisReviewOutcome", outcome)
+
+    with pytest.raises(ValueError, match="Unsupported analysis review outcome"):
+        create_analysis_review(outcome=invalid_outcome)
+
+
+@pytest.mark.parametrize("note", ["", "   ", "\t\n"])
+def test_analysis_review_rejects_blank_notes(note: str) -> None:
+    with pytest.raises(ValueError, match="must not be blank"):
+        create_analysis_review(outcome="acknowledged", note=note)
+
+
+def test_analysis_review_rejects_non_text_notes_at_runtime() -> None:
+    invalid_note = cast("str | None", 42)
+
+    with pytest.raises(ValueError, match="must be text or None"):
+        create_analysis_review(outcome="acknowledged", note=invalid_note)
+
+
+def test_analysis_review_enforces_note_length_boundary() -> None:
+    within_limit = create_analysis_review(outcome="needs_follow_up", note="a" * 2000)
+    assert len(within_limit["note"] or "") == 2000
+
+    with pytest.raises(ValueError, match="must not exceed 2000 characters"):
+        create_analysis_review(outcome="needs_follow_up", note="a" * 2001)
+
+
+def test_analysis_review_snapshot_is_json_serializable() -> None:
+    review = create_analysis_review(outcome="needs_follow_up", note="Collect further metrics.")
+
+    assert json.loads(json.dumps(review, allow_nan=False)) == review
+
+
+def test_legacy_incident_state_without_analysis_review_remains_readable() -> None:
+    # Historical checkpoints may have been written before the new optional channel.
+    legacy_state = dict(initial_incident_state(_incident()))
+    del legacy_state["analysis_review"]
+
+    assert legacy_state.get("analysis_review") is None
+    assert json.loads(json.dumps(legacy_state, allow_nan=False)) == legacy_state
 
 
 def test_parallel_evidence_merges_independent_of_completion_order() -> None:
@@ -251,14 +320,18 @@ def test_investigator_state_has_only_diagnostic_channels() -> None:
     }
     assert InvestigatorState.__required_keys__ == frozenset(hints)
     assert "hypotheses" not in hints
+    assert "analysis_review" not in hints
 
 
 def test_incident_state_extends_investigator_channels_without_redefinition() -> None:
     investigator_hints = get_type_hints(InvestigatorState, include_extras=True)
     incident_hints = get_type_hints(IncidentState, include_extras=True)
 
-    assert set(incident_hints) == {*investigator_hints, "hypotheses"}
-    assert IncidentState.__required_keys__ == frozenset(incident_hints)
+    assert set(incident_hints) == {*investigator_hints, "hypotheses", "analysis_review"}
+    assert IncidentState.__required_keys__ == frozenset({*investigator_hints, "hypotheses"})
+    assert IncidentState.__optional_keys__ == frozenset({"analysis_review"})
+    assert get_origin(incident_hints["analysis_review"]) is NotRequired
+    assert get_origin(incident_hints["investigation_plan"]) is not Annotated
     for field, annotation in investigator_hints.items():
         assert incident_hints[field] == annotation
 
@@ -278,6 +351,7 @@ def test_investigator_projection_is_json_safe_and_does_not_expose_hypotheses() -
     )
     parent["evidence"] = [snapshot_evidence(_evidence())]
     parent["hypotheses"] = [snapshot_hypothesis(_hypothesis())]
+    parent["analysis_review"] = create_analysis_review(outcome="acknowledged")
 
     # The projection is explicit here; parent/subgraph wiring comes in 2.0.5.3.
     diagnostic = InvestigatorState(
@@ -288,6 +362,7 @@ def test_investigator_projection_is_json_safe_and_does_not_expose_hypotheses() -
     )
 
     assert "hypotheses" not in diagnostic
+    assert "analysis_review" not in diagnostic
     assert json.loads(json.dumps(diagnostic, allow_nan=False)) == diagnostic
     diagnostic["evidence"][0]["metadata"]["error_rate"] = 0.5
     assert parent["evidence"][0]["metadata"]["error_rate"] == 0.15

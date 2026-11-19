@@ -6,7 +6,7 @@ JSON-compatible data and defines safe merging for parallel evidence branches.
 
 from copy import deepcopy
 from datetime import datetime
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal, NotRequired, TypedDict
 
 from ai_incident_commander.domain.evidence import Evidence, EvidenceMetadataValue
 from ai_incident_commander.domain.hypothesis import Hypothesis
@@ -25,6 +25,39 @@ type WorkflowPhase = Literal[
 
 
 type InvestigationSource = Literal["logs", "metrics"]
+
+
+type AnalysisReviewOutcome = Literal["acknowledged", "needs_follow_up"]
+
+
+class AnalysisReviewSnapshot(TypedDict):
+    """Untrusted diagnostic feedback, never a remediation approval."""
+
+    outcome: AnalysisReviewOutcome
+    note: str | None
+
+
+def create_analysis_review(
+    *, outcome: AnalysisReviewOutcome, note: str | None = None
+) -> AnalysisReviewSnapshot:
+    """Validate checkpoint-safe human feedback before writing graph state.
+
+    This is not an authorization decision. The authenticated operator identity
+    and any remediation approval remain outside the orchestration state.
+    """
+    if outcome not in ("acknowledged", "needs_follow_up"):
+        raise ValueError("Unsupported analysis review outcome.")
+    if note is not None:
+        if not isinstance(note, str):
+            raise ValueError("Analysis review note must be text or None.")
+        note = note.strip()
+        if not note:
+            raise ValueError("Analysis review note must not be blank.")
+        if len(note) > 2000:
+            raise ValueError("Analysis review note must not exceed 2000 characters.")
+    if outcome == "needs_follow_up" and note is None:
+        raise ValueError("Follow-up review requires a note.")
+    return AnalysisReviewSnapshot(outcome=outcome, note=note)
 
 
 class InvestigationPlanSnapshot(TypedDict):
@@ -143,6 +176,8 @@ class IncidentState(InvestigatorState):
     """
 
     hypotheses: list[HypothesisSnapshot]
+    # Older checkpoints may omit this key; consumers must use state.get().
+    analysis_review: NotRequired[AnalysisReviewSnapshot | None]
 
 
 def _optional_datetime(value: datetime | None) -> str | None:
@@ -205,4 +240,5 @@ def initial_incident_state(incident: Incident) -> IncidentState:
         investigation_plan=None,
         evidence=[],
         hypotheses=[],
+        analysis_review=None,
     )

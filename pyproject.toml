@@ -6,8 +6,9 @@ description = "Production-oriented AI system for investigating and resolving sof
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.16,<2.0",
-    "langgraph>=1.0,<2.0",
+    "langgraph>=1.2.12,<2.0",
     "langgraph-checkpoint-postgres>=3.2.1",
+    "pydantic>=2.0,<3.0",
     "psycopg[binary]>=3.2,<4.0",
     "sqlalchemy[asyncio]>=2.0,<3.0",
 ]
