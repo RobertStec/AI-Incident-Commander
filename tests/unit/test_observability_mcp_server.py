@@ -83,6 +83,56 @@ def test_acl_is_exact_match_and_copies_mutable_input() -> None:
         policy.resolve(allowed_token(subject="human-1"), "checkout")
 
 
+def test_acl_matches_service_account_subject_exactly() -> None:
+    subject = "00000000-0000-4000-8000-000000000001"
+    other_subject = "00000000-0000-4000-8000-000000000002"
+    service = "aic-otlp-ingestion-probe"
+
+    policy = AuthorizedLokiScopes(
+        {
+            ObservabilityPrincipal(
+                client_id="incident-worker",
+                subject=subject,
+            ): {
+                service: LokiLogScope(
+                    labels={
+                        "service_name": service,
+                        "deployment_environment_name": "local",
+                    },
+                    tenant_id="tenant-1",
+                )
+            }
+        }
+    )
+
+    authorized_scope = policy.resolve(
+        allowed_token(subject=subject),
+        service,
+    )
+
+    assert authorized_scope.tenant_id == "tenant-1"
+    assert authorized_scope.labels == {
+        "service_name": service,
+        "deployment_environment_name": "local",
+    }
+
+    wrong_client = AccessToken(
+        token="not-a-real-token",
+        client_id="other-worker",
+        subject=subject,
+        scopes=[READ_LOGS_SCOPE],
+        resource=RESOURCE,
+    )
+
+    for denied_token in (
+        allowed_token(),
+        allowed_token(subject=other_subject),
+        wrong_client,
+    ):
+        with pytest.raises(MCPError, match="OBS_ACCESS_DENIED"):
+            policy.resolve(denied_token, service)
+
+
 def test_acl_requires_verified_identity_and_scope() -> None:
     with pytest.raises(MCPError, match="OBS_ACCESS_DENIED"):
         acl().resolve(None, "checkout")

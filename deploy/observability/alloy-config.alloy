@@ -1,0 +1,40 @@
+// Read-only pipeline configuration. A trusted local application sends OTLP HTTP
+// using Basic authentication. Only LOGS are forwarded; metrics/traces are not
+// collected in this stage. Never expose this receiver to the public Internet.
+
+otelcol.auth.basic "otlp_ingest" {
+  htpasswd {
+    file = "/run/secrets/otlp_htpasswd"
+  }
+}
+
+otelcol.receiver.otlp "application_logs" {
+  http {
+    endpoint = "0.0.0.0:4318"
+    auth     = otelcol.auth.basic.otlp_ingest.handler
+  }
+
+  output {
+    logs = [otelcol.processor.batch.application_logs.input]
+  }
+}
+
+otelcol.processor.batch "application_logs" {
+  output {
+    logs = [otelcol.exporter.otlphttp.loki.input]
+  }
+}
+
+// Loki 3.x has a native OTLP logs endpoint. The exporter appends /v1/logs.
+// One collector is bound to one fixed trusted tenant; tenant selection is NOT
+// supplied by the incoming telemetry. Multi-tenant setups need separate
+// per-tenant trust boundaries, not a caller-controlled X-Scope-OrgID header.
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "http://loki:3100/otlp"
+    headers = {
+      "X-Scope-OrgID" = sys.env("AIC_LOKI_TENANT"),
+    }
+    timeout = "10s"
+  }
+}

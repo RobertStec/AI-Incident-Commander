@@ -1,0 +1,36 @@
+{
+  "oauth": {
+    "issuer_url": "https://auth.example.internal/realms/incident-commander",
+    "resource_url": "https://mcp.example.internal/mcp",
+    "introspection_url": "https://auth.example.internal/realms/incident-commander/protocol/openid-connect/token/introspect",
+    "client_id": "observability-mcp-introspection",
+    "client_secret_file": "/run/secrets/observability_mcp_introspection_secret",
+    "timeout_seconds": 5.0
+  },
+  "loki": {
+    "base_url": "https://loki.example.internal",
+    "allow_plain_http": false,
+    "timeout_seconds": 10.0,
+    "connect_timeout_seconds": 3.0,
+    "max_connections": 20,
+    "username": "observability-readonly",
+    "password_file": "/run/secrets/loki_readonly_password"
+  },
+  "http": {
+    "allowed_hosts": ["mcp.example.internal"],
+    "allowed_origins": [],
+    "max_request_body_bytes": 65536
+  },
+  "grants": [
+    {
+      "client_id": "incident-worker",
+      "subject": null,
+      "service_name": "checkout",
+      "labels": {
+        "service_name": "checkout",
+        "environment": "production"
+      },
+      "tenant_id": "incident-commander"
+    }
+  ]
+}

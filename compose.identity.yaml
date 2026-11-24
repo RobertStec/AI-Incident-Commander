@@ -1,0 +1,102 @@
+# Local identity stack for AI Incident Commander.
+# Separate from existing PostgreSQL (incident data) and Observability (Loki/Alloy).
+# Start only with -f compose.identity.yaml when TLS files and secrets exist.
+name: ai-incident-commander
+
+services:
+  keycloak-db:
+    image: postgres:16.16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD_FILE: /run/secrets/keycloak_db_password
+    secrets:
+      - keycloak_db_password
+    volumes:
+      - keycloak_pgdata:/var/lib/postgresql/data
+    networks:
+      - identity_backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    # No host ports; this database is not the incident_command app database.
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    # Explicit production mode (`start`, never `start-dev`).
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        KC_DB_PASSWORD="$$(< /run/secrets/keycloak_db_password)"
+        export KC_DB_PASSWORD
+        exec /opt/keycloak/bin/kc.sh start
+    restart: unless-stopped
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_HOSTNAME: https://localhost:8443
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_CERTIFICATE_FILE: /run/secrets/keycloak_tls_cert
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /run/secrets/keycloak_tls_key
+      KC_HEALTH_ENABLED: "true"
+      # The management endpoint is accessible only inside the container.
+      KC_HTTP_MANAGEMENT_SCHEME: http
+    secrets:
+      - keycloak_db_password
+      - keycloak_tls_cert
+      - keycloak_tls_key
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    networks:
+      - identity_backend
+      - identity_ingress
+    ports:
+      - "127.0.0.1:${AIC_KEYCLOAK_HTTPS_PORT:-8443}:8443"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    healthcheck:
+      # The upstream minimal image lacks curl/wget; Bash built-ins avoid adding tools.
+      test:
+        - CMD
+        - /bin/bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf 'HEAD /health/ready HTTP/1.0\r\n\r\n' >&3;
+          IFS= read -r status <&3;
+          [[ "$$status" == *' 200 '* ]]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    stop_grace_period: 60s
+    # Do not publish Keycloak management port 9000 or unencrypted HTTP 8080.
+
+volumes:
+  keycloak_pgdata:
+
+secrets:
+  keycloak_db_password:
+    file: ${AIC_KEYCLOAK_DB_PASSWORD_FILE:?set AIC_KEYCLOAK_DB_PASSWORD_FILE}
+  keycloak_tls_cert:
+    file: ${AIC_KEYCLOAK_TLS_CERT_FILE:?set AIC_KEYCLOAK_TLS_CERT_FILE}
+  keycloak_tls_key:
+    file: ${AIC_KEYCLOAK_TLS_KEY_FILE:?set AIC_KEYCLOAK_TLS_KEY_FILE}
+
+networks:
+  identity_backend:
+    internal: true
+  identity_ingress:
+    driver: bridge

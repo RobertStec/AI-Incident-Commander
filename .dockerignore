@@ -1,0 +1,21 @@
+# Default deny: only explicitly approved build inputs.
+**
+
+# Python project metadata and reproducible dependencies.
+!pyproject.toml
+!uv.lock
+!README.md
+
+# Application source code.
+!src/
+!src/**
+
+# Defense in depth: never include secrets or local artifacts.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/__pycache__/
+**/*.pyc
