@@ -1,6 +1,8 @@
 """Opt-in integration tests against an explicitly configured Keycloak test realm."""
 
 import asyncio
+import base64
+import json
 import os
 import ssl
 from pathlib import Path
@@ -85,5 +87,59 @@ def test_keycloak_issues_token_accepted_by_introspection_verifier() -> None:
             assert identity.subject is not None
             assert REQUIRED_SCOPE in identity.scopes
             assert str(identity.resource) == resource
+
+            # Optional scopes must not be granted implicitly.
+            response_without_scope = await client.post(
+                f"{issuer}/protocol/openid-connect/token",
+                auth=httpx.BasicAuth("incident-worker", worker_secret),
+                data={
+                    "grant_type": "client_credentials",
+                },
+            )
+
+            assert response_without_scope.status_code == 200
+
+            token_payload = response_without_scope.json()
+
+            unscoped_token = token_payload.get("access_token")
+            assert isinstance(unscoped_token, str) and unscoped_token
+
+            granted_scopes = token_payload.get("scope", "")
+            assert isinstance(granted_scopes, str)
+
+            assert REQUIRED_SCOPE not in granted_scopes.split(), (
+                "Keycloak implicitly granted the optional observability scope"
+            )
+
+            # Diagnostic only: inspect the JWT audience without trusting
+            # unverified claims as an authorization decision.
+            parts = unscoped_token.split(".")
+            assert len(parts) == 3, "Expected a JWT access token"
+
+            encoded_payload = parts[1]
+            padding = "=" * (-len(encoded_payload) % 4)
+
+            claims = json.loads(base64.urlsafe_b64decode(encoded_payload + padding))
+            assert isinstance(claims, dict)
+
+            raw_audience = claims.get("aud")
+
+            if isinstance(raw_audience, str):
+                audiences = {raw_audience}
+            elif isinstance(raw_audience, list) and all(
+                isinstance(value, str) for value in raw_audience
+            ):
+                audiences = set(raw_audience)
+            else:
+                audiences = set()
+
+            print(
+                "Unscoped token MCP audience present:",
+                resource in audiences,
+            )
+            print(
+                "Unscoped token introspection audience present:",
+                "observability-mcp-introspection" in audiences,
+            )
 
     asyncio.run(scenario())

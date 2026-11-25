@@ -2,13 +2,15 @@
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from mcp.server.auth.provider import AccessToken
 from starlette.applications import Starlette
 
 from ai_incident_commander.application.observability_mcp_runtime import (
@@ -16,6 +18,9 @@ from ai_incident_commander.application.observability_mcp_runtime import (
     _load_settings,
     create_app,
     redact_structured_log,
+)
+from ai_incident_commander.infrastructure.oauth_introspection import (
+    OAuthIntrospectionVerifier,
 )
 
 
@@ -143,6 +148,69 @@ def test_runtime_lifespan_starts_mcp_and_refuses_unauthenticated_http(
                     json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                 )
                 assert response.status_code == 401
+
+    asyncio.run(scenario())
+
+
+def test_runtime_rejects_authenticated_token_without_required_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_file = tmp_path / "oauth-secret"
+    secret_file.write_text("synthetic-secret", encoding="utf-8")
+
+    config = _runtime_config(secret_file)
+    monkeypatch.setenv(CONFIG_ENV, str(_write_config(tmp_path, config)))
+
+    async def scenario() -> None:
+        with patch.object(
+            OAuthIntrospectionVerifier,
+            "verify_token",
+            new_callable=AsyncMock,
+        ) as verify_token:
+            # Simulate an identity that passed token verification.
+            # Only the required observability scope is missing.
+            verify_token.return_value = AccessToken(
+                token="synthetic-token",
+                client_id="incident-worker",
+                scopes=["profile"],
+                resource="https://mcp.example.test/mcp",
+                subject="test-service-account",
+                expires_at=int(time.time()) + 3600,
+                claims={
+                    "iss": "https://auth.example.test/realms/incidents",
+                },
+            )
+
+            app = create_app()
+
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://mcp.example.test",
+                    timeout=10.0,
+                    trust_env=False,
+                ) as client:
+                    response = await client.post(
+                        "/mcp",
+                        headers={
+                            "Authorization": "Bearer synthetic-token",
+                            "Accept": "application/json, text/event-stream",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {},
+                        },
+                    )
+
+            verify_token.assert_awaited_once_with("synthetic-token")
+
+            assert response.status_code == 403
+            assert response.json().get("error") == "insufficient_scope"
+            assert "insufficient_scope" in response.headers.get("www-authenticate", "")
 
     asyncio.run(scenario())
 
