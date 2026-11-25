@@ -2,7 +2,7 @@
 
 import json
 import os
-import re
+import secrets
 import ssl
 import sys
 import time
@@ -61,20 +61,52 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
     if not ca_file or not Path(ca_file).is_file():
         pytest.fail("A valid MCP test CA file is required")
 
-    # The bearer token is supplied through stdin, never through environment.
-    # Pytest must be executed with -s for this opt-in test.
-    token = sys.stdin.read(8193).strip()
+    # Credentials are supplied exclusively through stdin.
+    # Pytest must run with -s for authenticated integration tests.
+    redaction_test = os.environ.get("RUN_OBSERVABILITY_MCP_REDACTION_TESTS") == "1"
 
-    if not token or len(token) > 8192 or any(char.isspace() for char in token):
+    otlp_password: str | None = None
+
+    if redaction_test:
+        if os.environ.get("AIC_TEST_OTLP_URL") != ("http://alloy:4318/v1/logs"):
+            pytest.fail("Redaction E2E requires the private local OTLP endpoint")
+
+        raw_credentials = sys.stdin.read(16385)
+
+        if len(raw_credentials) > 16384:
+            pytest.fail("E2E credentials input exceeds size limit")
+
+        try:
+            credentials = json.loads(raw_credentials)
+        except json.JSONDecodeError:
+            pytest.fail("Invalid E2E credentials input")
+
+        if not isinstance(credentials, dict):
+            pytest.fail("E2E credentials must be a JSON object")
+
+        token = credentials.get("access_token")
+        otlp_password = credentials.get("otlp_password")
+
+        if (
+            not isinstance(otlp_password, str)
+            or not 0 < len(otlp_password) <= 512
+            or any(char in otlp_password for char in "\r\n")
+        ):
+            pytest.fail("Missing or invalid OTLP test credentials")
+
+    else:
+        token = sys.stdin.read(8193).strip()
+
+    if (
+        not isinstance(token, str)
+        or not token
+        or len(token) > 8192
+        or any(char.isspace() for char in token)
+    ):
         pytest.fail("Missing or invalid bearer token on stdin")
 
-    probe_trace_id = None
-
-    if os.environ.get("RUN_OBSERVABILITY_MCP_REDACTION_TESTS") == "1":
-        probe_trace_id = os.environ.get("AIC_TEST_MCP_REDACTION_TRACE_ID")
-
-        if not isinstance(probe_trace_id, str) or not re.fullmatch(r"[0-9a-f]{32}", probe_trace_id):
-            pytest.fail("Valid redaction probe trace_id is required")
+    # The test creates its own unique correlation identifier.
+    probe_trace_id = secrets.token_hex(16) if redaction_test else None
 
     tls_context = ssl.create_default_context(cafile=ca_file)
 
@@ -294,6 +326,64 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
         assert jsonrpc_denied or tool_denied, "MCP must explicitly deny services outside the ACL"
 
         if probe_trace_id is not None:
+            assert isinstance(otlp_password, str)
+
+            # Create a synthetic log with a unique correlation identifier.
+            # No real credentials or sensitive application data are emitted.
+            probe_body = {
+                "event": "redaction_probe",
+                "trace_id": probe_trace_id,
+                "synthetic_canary": "AIC_SYNTHETIC_TEST_ONLY",
+            }
+
+            otlp_payload = {
+                "resourceLogs": [
+                    {
+                        "resource": {
+                            "attributes": [
+                                {
+                                    "key": "service.name",
+                                    "value": {"stringValue": "aic-otlp-ingestion-probe"},
+                                },
+                                {
+                                    "key": "deployment.environment.name",
+                                    "value": {"stringValue": "local"},
+                                },
+                            ]
+                        },
+                        "scopeLogs": [
+                            {
+                                "scope": {"name": "aic-redaction-integration"},
+                                "logRecords": [
+                                    {
+                                        "timeUnixNano": str(time.time_ns()),
+                                        "severityNumber": 9,
+                                        "severityText": "INFO",
+                                        "body": {"stringValue": json.dumps(probe_body)},
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+            # This URL was strictly validated before reading credentials.
+            otlp_response = client.post(
+                os.environ["AIC_TEST_OTLP_URL"],
+                auth=httpx.BasicAuth(
+                    "incident-collector",
+                    otlp_password,
+                ),
+                json=otlp_payload,
+            )
+
+            assert otlp_response.status_code == 200, (
+                f"OTLP ingestion rejected the probe: HTTP {otlp_response.status_code}"
+            )
+
+            print("Controlled OTLP log submission: ACCEPTED")
+
             matching_probe_entries = []
 
             # Allow bounded time for asynchronous Alloy -> Loki ingestion.
@@ -322,6 +412,11 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
 
                 probe_result = read_result(response, 5)
                 assert probe_result.get("isError") is not True
+
+                # Verify that no MCP response field exposes the synthetic secret.
+                assert "AIC_SYNTHETIC_TEST_ONLY" not in response.text, (
+                    "MCP response leaked the synthetic canary"
+                )
 
                 probe_data = probe_result.get("structuredContent")
                 assert isinstance(probe_data, dict)
