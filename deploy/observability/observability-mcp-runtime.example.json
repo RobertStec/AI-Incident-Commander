@@ -24,7 +24,7 @@
   "grants": [
     {
       "client_id": "incident-worker",
-      "subject": null,
+      "subject": "00000000-0000-4000-8000-000000000001",
       "service_name": "checkout",
       "labels": {
         "service_name": "checkout",

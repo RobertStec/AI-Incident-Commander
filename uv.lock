@@ -9,6 +9,7 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "mcp" },
@@ -34,6 +35,7 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.16,<2.0" },
     { name = "httpx", specifier = ">=0.28,<1.0" },
+    { name = "httpx2", specifier = ">=2.16.1,<3.0" },
     { name = "langgraph", specifier = ">=1.2.12,<2.0" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.2.1" },
     { name = "mcp", specifier = ">=2.3,<3.0" },

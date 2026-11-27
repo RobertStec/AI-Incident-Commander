@@ -1,0 +1,37 @@
+{
+  "oauth": {
+    "issuer_url": "https://auth.aic.test:8443/realms/incidents",
+    "resource_url": "https://observability-mcp:8000/mcp",
+    "introspection_url": "https://auth.aic.test:8443/realms/incidents/protocol/openid-connect/token/introspect",
+    "client_id": "observability-mcp-introspection",
+    "client_secret_file": "/run/secrets/observability_mcp_introspection_secret",
+    "ca_bundle_file": "/run/ca/dev-ca.crt",
+    "timeout_seconds": 5.0
+  },
+  "loki": {
+    "base_url": "http://loki:3100",
+    "allow_plain_http": true,
+    "timeout_seconds": 10.0,
+    "connect_timeout_seconds": 3.0,
+    "max_connections": 20
+  },
+  "http": {
+    "allowed_hosts": [
+      "observability-mcp:8000"
+    ],
+    "allowed_origins": [],
+    "max_request_body_bytes": 65536
+  },
+  "grants": [
+    {
+      "client_id": "incident-worker",
+      "subject": "00000000-0000-4000-8000-000000000001",
+      "service_name": "aic-otlp-ingestion-probe",
+      "labels": {
+        "service_name": "aic-otlp-ingestion-probe",
+        "deployment_environment_name": "local"
+      },
+      "tenant_id": "tenant-1"
+    }
+  ]
+}

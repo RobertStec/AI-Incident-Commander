@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _otlp_probe import build_redaction_probe
 
 MCP_TEST_URL = "https://observability-mcp:8000/mcp"
 
@@ -124,11 +125,16 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
         },
     }
 
-    def read_result(response: httpx.Response, request_id: int) -> dict:
+    def read_result(
+        response: httpx.Response,
+        request_id: int,
+    ) -> dict[str, object]:
         assert response.status_code == 200
         assert len(response.content) <= 65536
 
         content_type = response.headers.get("content-type", "").split(";")[0].strip()
+
+        messages: list[object]
 
         if content_type == "application/json":
             messages = [response.json()]
@@ -141,13 +147,19 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
         else:
             pytest.fail("Unexpected MCP response content type")
 
-        results = [
-            message["result"]
-            for message in messages
-            if isinstance(message, dict)
-            and message.get("id") == request_id
-            and isinstance(message.get("result"), dict)
-        ]
+        results: list[dict[str, object]] = []
+
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+
+            if message.get("id") != request_id:
+                continue
+
+            candidate: object = message.get("result")
+
+            if isinstance(candidate, dict):
+                results.append(candidate)
 
         assert len(results) == 1
         return results[0]
@@ -172,14 +184,17 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
 
         initialized = read_result(response, 1)
 
-        assert initialized.get("protocolVersion") == "2025-11-25"
+        protocol_version = initialized.get("protocolVersion")
+
+        assert isinstance(protocol_version, str)
+        assert protocol_version == "2025-11-25"
         assert isinstance(initialized.get("serverInfo"), dict)
 
         session_id = response.headers.get("mcp-session-id")
         if session_id:
             headers["Mcp-Session-Id"] = session_id
 
-        headers["MCP-Protocol-Version"] = initialized["protocolVersion"]
+        headers["MCP-Protocol-Version"] = protocol_version
 
         notification = client.post(
             url,
@@ -328,45 +343,7 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
         if probe_trace_id is not None:
             assert isinstance(otlp_password, str)
 
-            # Create a synthetic log with a unique correlation identifier.
-            # No real credentials or sensitive application data are emitted.
-            probe_body = {
-                "event": "redaction_probe",
-                "trace_id": probe_trace_id,
-                "synthetic_canary": "AIC_SYNTHETIC_TEST_ONLY",
-            }
-
-            otlp_payload = {
-                "resourceLogs": [
-                    {
-                        "resource": {
-                            "attributes": [
-                                {
-                                    "key": "service.name",
-                                    "value": {"stringValue": "aic-otlp-ingestion-probe"},
-                                },
-                                {
-                                    "key": "deployment.environment.name",
-                                    "value": {"stringValue": "local"},
-                                },
-                            ]
-                        },
-                        "scopeLogs": [
-                            {
-                                "scope": {"name": "aic-redaction-integration"},
-                                "logRecords": [
-                                    {
-                                        "timeUnixNano": str(time.time_ns()),
-                                        "severityNumber": 9,
-                                        "severityText": "INFO",
-                                        "body": {"stringValue": json.dumps(probe_body)},
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ]
-            }
+            otlp_payload = build_redaction_probe(probe_trace_id)
 
             # This URL was strictly validated before reading credentials.
             otlp_response = client.post(
@@ -384,7 +361,7 @@ def test_mcp_authenticated_tools_enforce_allow_and_deny_acl() -> None:
 
             print("Controlled OTLP log submission: ACCEPTED")
 
-            matching_probe_entries = []
+            matching_probe_entries: list[dict[str, object]] = []
 
             # Allow bounded time for asynchronous Alloy -> Loki ingestion.
             for _ in range(20):

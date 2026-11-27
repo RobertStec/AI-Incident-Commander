@@ -4,7 +4,7 @@
 
 AI Incident Commander is an AI Engineering portfolio project for investigating production incidents, collecting evidence from operational systems, assessing root-cause hypotheses, and proposing controlled remediation. Its target architecture combines **LangGraph**, **custom MCP servers and clients**, **advanced RAG**, and a **Human-in-the-Loop security boundary**.
 
-> **Current maturity (November 2026):** A read-only LangGraph incident coordinator and nested Investigator Subgraph are implemented and tested. They support a validated investigation plan, conditional log/metric collection, parallel execution, and deterministic evidence aggregation. Checkpoint persistence is tested with both in-memory storage and PostgreSQL. Separately, the durable remediation approval, Guard, execution-claim, lifecycle, and dispatch-reservation foundations are implemented and tested. **End-to-end remediation, live MCP execution, advanced RAG, production authentication/RBAC, and recovery of interrupted graph execution are not implemented yet.**
+> **Current maturity (November 27, 2026):** The read-only LangGraph coordinator and nested Investigator Subgraph support validated planning, conditional and parallel evidence collection, deterministic aggregation, PostgreSQL checkpointing, tested manual recovery, optional analysis review via interrupts, and controlled retries for transient read-only failures. A custom Observability MCP server and its OAuth-authenticated client have been implemented and tested against local Keycloak, Alloy, and Loki. **The live MCP client is not yet wired into the LangGraph collectors.** Durable remediation security foundations are implemented separately; mutating MCP execution, advanced RAG, application-level production authentication/RBAC, and cloud deployment remain future work.
 
 ## Architecture evolution: `apv:v1` → `apv:v2`
 
@@ -85,9 +85,13 @@ The project targets **Strong Mid / Mid+ AI Engineering**, with selected senior-l
                            langgraph_checkpoint
 ```
 
-The planner is injectable and currently deterministic by default. Log and metric collectors are asynchronous injected dependencies; **live observability integrations are not yet implemented**. The evidence reducer deduplicates by stable evidence ID and rejects conflicting snapshots. The main graph retains state that does not belong to the Investigator Subgraph, including hypotheses.
+The planner is injectable and currently deterministic by default. Log and metric collectors are asynchronous injected dependencies; **the independently implemented Observability MCP client is not yet connected to the log collector**. Live metrics collection is also pending. The evidence reducer deduplicates by stable evidence ID and rejects conflicting snapshots. The main graph retains state that does not belong to the Investigator Subgraph, including hypotheses.
 
-PostgreSQL checkpointing uses a dedicated schema, an explicit schema-initialization operation, and a separate connection lifecycle. It has been verified across independently opened connections and graph instances. **Checkpoint persistence does not yet imply safe crash recovery, automatic resumption of interrupted nodes, or exactly-once external effects.** The current local database setup does not yet provide dedicated checkpoint-runtime role isolation.
+PostgreSQL checkpointing uses a dedicated schema, an explicit schema-initialization operation, and a separate connection lifecycle. Manual resume has been verified across connections, graph instances, and separate processes, including a controlled process termination after the successful log collector's pending write was persisted. Completed work was not replayed in the tested scenarios.
+
+An optional `analysis_review` node uses LangGraph `interrupt()` and `Command(resume=...)`, with validated review input and durable state across PostgreSQL connection lifecycles. This is diagnostic feedback, **not approval for remediation**. Read-only collectors support an opt-in `RetryPolicy` for `TransientEvidenceCollectionError`; permanent validation, authorization, and contract failures must not be blindly retried.
+
+These tests do not establish automatic recovery at arbitrary crash points, concurrent resume safety, production checkpoint access control, or exactly-once external effects. Dedicated checkpoint-runtime database role isolation remains pending.
 
 ### Separately implemented remediation security foundation
 
@@ -108,10 +112,33 @@ Trusted Action Catalog + MCP tool bindings
                    |
        Secure MCP executor [contract only]
                    |
-      Live MCP operations [not implemented]
+      Mutating MCP operations [not implemented]
 ```
 
 These are framework-independent domain and application services. **They are not yet connected into an end-to-end LangGraph remediation workflow.** Authorization decisions belong in trusted application and persistence layers, not in LLM prompts.
+
+### Implemented standalone Observability MCP integration
+
+```text
+ Local OTLP producer → Alloy → Loki
+                                ^
+                                | bounded read-only log queries
+                                |
+ Keycloak ← HTTPS → Observability MCP Server
+     ^                 ^         (introspection, ACL, redaction)
+     |                 |
+     | OAuth / TLS     | MCP Streamable HTTP / TLS
+     |                 |
+     +------ Observability MCP Client
+                       |
+               [LangGraph adapter pending]
+```
+
+The custom server exposes `search_service_logs` on a private HTTPS endpoint. It uses OAuth token introspection, scoped authorization, exact principal matching (`client_id` and `subject`), service-level ACLs, tenant/label restrictions, and log redaction. Its server-side introspection credentials are separate from the worker credentials.
+
+The Python client uses the MCP SDK v2 and HTTPX2 with a managed asynchronous lifecycle, OAuth Client Credentials, an explicit issuer, a configurable CA bundle, bounded file-based secret loading, and in-memory token storage. Its outbound request policy constrains HTTPS destinations, methods, authorization schemes, and the token request's grant type and read-only scope (`observability:logs:read`). Tests cover untrusted discovery endpoints, unsafe redirects, scope escalation, malformed token forms, real TLS failures, authenticated calls, and service ACL denial.
+
+The live integration test retrieves a uniquely identified synthetic log from Loki through the actual MCP client and verifies that the synthetic sensitive value is absent from the returned result. A separate raw HTTP/JSON-RPC suite checks the server contract independently of the SDK. No live mutating MCP executor is implemented.
 
 ## Implementation status
 
@@ -127,11 +154,14 @@ These are framework-independent domain and application services. **They are not 
 | Main Incident Graph + nested Investigator Subgraph | Implemented and tested |
 | Deterministic planning, conditional routing, parallel read-only collectors | Implemented and tested with injected collectors |
 | In-memory and PostgreSQL checkpointing | Implemented and tested; isolated schema and explicit setup |
-| Safe resume after process interruption, retries, and graph-level Human-in-the-Loop interrupts | Not yet implemented or verified |
-| Secure MCP executor | **Contract only**; no live external calls |
-| Live observability integrations, custom MCP servers, and MCP client | Planned |
+| Manual durable resume for read-only investigation | Implemented and tested in controlled failure and process-restart scenarios |
+| Optional graph-level analysis review and controlled read-only retries | Implemented and tested; not remediation approval |
+| Secure mutating MCP executor | **Contract only**; no live mutating external calls |
+| Local Keycloak, Alloy, Loki, and custom read-only Observability MCP server | Implemented and integration-tested |
+| OAuth-authenticated Observability MCP client | Implemented and integration-tested independently of LangGraph |
+| Live log collector adapter, live metrics and other MCP sources | Planned |
 | Advanced RAG, hypothesis evaluation, and incident report generation | Planned |
-| Full FastAPI application, production authentication/RBAC, observability, CI/CD, and cloud deployment | Planned / not yet verified as complete |
+| Full FastAPI application, production authentication/RBAC, application-wide observability, CI/CD, and cloud deployment | Planned / not yet verified as complete |
 
 ### Security invariants already represented in code
 
@@ -142,7 +172,8 @@ These are framework-independent domain and application services. **They are not 
 - `EXECUTING` / `UNKNOWN` states do **not** authorize blind retries after a crash or timeout.
 - Checkpoint serialization is configured without a pickle fallback; checkpoint content still requires restricted access and appropriate trust boundaries.
 - The system does **not** claim exactly-once external effects. Downstream idempotency and reconciliation remain future work.
-- Production authentication/RBAC and a privileged MCP execution boundary remain future work; test-only authorization doubles are not production authentication.
+- Read-only MCP connections require TLS verification and scoped OAuth credentials; discovery and token exchanges are constrained by trusted configuration. Service ACLs and redaction are enforced by the server, not by an LLM.
+- Production authentication/RBAC and a privileged mutating MCP execution boundary remain future work; test-only authorization doubles are not production authentication.
 
 ## Development and verification
 
@@ -150,32 +181,78 @@ Development uses **Python 3.12**, `uv`, `pytest`, Ruff, Mypy, LangGraph, Psycopg
 
 ```bash
 # Unit tests (do not require PostgreSQL)
-uv run pytest -q tests/unit/
+uv run --no-sync pytest -q tests/unit/
 
-# Full regression, including approval, schema, and checkpoint integration tests
+# Regression including approval, schema, and checkpoint integration tests
+# OAuth and MCP integration tests have separate opt-in runs.
 RUN_DB_APPROVAL_TESTS=1 \
 RUN_DB_SCHEMA_TESTS=1 \
 RUN_DB_CHECKPOINT_TESTS=1 \
-uv run --env-file .env pytest -q
+RUN_KEYCLOAK_OAUTH_TESTS=0 \
+RUN_OBSERVABILITY_MCP_HTTP_TESTS=0 \
+RUN_OBSERVABILITY_MCP_AUTH_TESTS=0 \
+RUN_OBSERVABILITY_MCP_REDACTION_TESTS=0 \
+RUN_OBSERVABILITY_MCP_CLIENT_TESTS=0 \
+uv run --no-sync --env-file .env pytest -q
 
-# Lint, formatting and strict type checks
-uv run ruff check src/ tests/ migrations/versions/
-uv run ruff format --check src/ tests/ migrations/versions/
-uv run mypy src/ai_incident_commander/
+# Lint, formatting, strict type checks, and lockfile consistency
+uv run --no-sync ruff check src/ tests/ migrations/versions/
+uv run --no-sync ruff format --check src/ tests/ migrations/versions/
+MYPYPATH=src uv run --no-sync mypy src/ai_incident_commander/
+uv lock --check
 
 # Application database migration state (requires PostgreSQL)
-uv run --env-file .env alembic current
+uv run --no-sync --env-file .env alembic current
 ```
 
-**Latest confirmed full regression (November 18, 2026): `1519 passed`**, with all three PostgreSQL test groups enabled. Latest static checks: Ruff lint passed, 128 files formatted, and Mypy strict found no issues in 58 source files. These are **local development/test results**, not a claim of production deployment.
+### Local Observability MCP verification
 
+The following instructions assume a provisioned local development stack. They are not a complete automated installation or production deployment procedure.
+
+- Use `.env.example` as the environment variable reference. Keep actual credentials and deployment-managed TLS material outside Git.
+- The local OAuth issuer is `https://auth.aic.test:8443/realms/incidents`. Resolve `auth.aic.test` to `127.0.0.1` on the WSL host and to Keycloak via the Docker network alias. Use a trusted local CA and a Keycloak certificate valid for that hostname.
+- The private MCP endpoint is `https://observability-mcp:8000/mcp`, with a certificate valid for `observability-mcp`. Neither MCP nor Loki publishes a host port. Local OTLP HTTP ingress is authenticated and bound to host loopback.
+- The Keycloak realm must contain the confidential `incident-worker` client, the separate `observability-mcp-introspection` client, the required read-only scope, and compatible token audiences for the MCP resource and introspection service.
+- Copy the local template `deploy/observability/observability-mcp-runtime.local.example.json` to the external runtime path `$HOME/.config/ai-incident-commander/mcp/observability/runtime.json`. Replace the illustrative UUID in `grants[].subject` with the actual authorized service-account `sub` obtained through token introspection. Provision matching tenant and service labels, the secret files, certificates, and readable mounts required by the Compose configuration. Do not copy the resulting private configuration back into Git.
+- `deploy/observability/observability-mcp-runtime.example.json` is a production-oriented reference, not a deployment-ready configuration. It requires environment-specific endpoints, credentials, trust settings, and grants. Plain HTTP to Loki is enabled only in the local example.
+
+With the identity, observability, and MCP stacks running, build the test image from the repository root and run the local client suite:
+
+```bash
+docker build --target integration-test \
+  --tag ai-incident-commander/observability-mcp-tests:local .
+
+uv run --no-sync python tests/integration/_run_observability_mcp_client_tests.py
+```
+
+The runner prompts for the local OTLP `incident-collector` password without terminal echo, emits a synthetic log through `127.0.0.1:4318`, and passes its trace ID to the isolated container. The worker secret is read from `$HOME/.config/ai-incident-commander/keycloak/clients/incident-worker.secret` and passed through stdin to a temporary file on container tmpfs. The runner does not give the client container direct access to Alloy or Loki. The test image must be rebuilt when application code or dependencies change.
+
+This is an interactive local test workflow, not an unattended CI pipeline. The separate HTTP suite uses its own runner and opt-in flags.
+
+### Latest verified results (November 27, 2026)
+
+| Verification | Result |
+|---|---|
+| Regression with PostgreSQL opt-ins | **1725 passed, 9 expected skips, 0 failed** |
+| Separately executed OAuth / MCP integration cases | 1 Keycloak + 6 MCP client + 2 MCP HTTP passed |
+| MCP client lifecycle/security tests | 25 passed (included in the regression) |
+| Test runner unit tests | 11 passed (included in the regression) |
+| Ruff lint / format | Passed; 152 files already formatted |
+| Mypy (application source) | Passed; 66 source files |
+| `uv lock --check` | Passed; 88 packages resolved |
+| Gitleaks v8.30.1 | No findings in the scanned working-tree snapshot or 46 locally available commits after a narrow JDBC URL false-positive exception |
+| Gitleaks allowlist checks | 5/5 passed |
+
+The nine opt-in cases were verified separately, not as part of a single 1734-test run. Secret scanning uses `.gitleaks.toml` and a narrowly scoped exception for a non-secret JDBC URL. It does not guarantee absence of all secrets or replace dependency vulnerability scanning. A final staged scan is required after documentation and configuration changes.
+
+These are local development/test results, not a claim of production deployment.
 The LangGraph checkpoint schema is initialized **explicitly**, not automatically on application startup. Its integration tests do not run schema migrations or wipe existing checkpoint tables.
 
 ## Roadmap
 
-**Next milestone:** durable execution semantics — controlled recovery and resumption after interruption, including tests for re-execution boundaries and failure behavior.
+**Next engineering milestone:** integrate the read-only Observability MCP client with the LangGraph log evidence collector, preserving trusted configuration, typed evidence, lifecycle management, bounded calls, and explicit transient versus permanent error classification.
 
-Further work will extend the investigation flow with real observability and deployment sources, advanced RAG, hypothesis ranking, and incident reporting. Later milestones include integrating remediation behind a secure Human-in-the-Loop boundary, implementing MCP clients and servers, verifying results, and adding production-grade authentication, evaluation, observability, CI/CD, and deployment.
+Further work will add live metrics and deployment sources, additional custom MCP servers, advanced RAG, hypothesis ranking, and incident reporting. Later milestones include end-to-end remediation behind the existing approval/Guard/claim/dispatch boundary, downstream idempotency and reconciliation, outcome verification, production authentication/RBAC, evaluation, monitoring, CI/CD, and AWS deployment.
 
 The existing durable remediation security foundation was developed ahead of the end-to-end remediation workflow. Its presence **does not** mean that external actions or the complete incident-response workflow are implemented.
 

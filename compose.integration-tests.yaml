@@ -40,6 +40,45 @@ services:
       - mcp_internal
       - otlp_ingress
 
+  observability-client-e2e:
+    image: ai-incident-commander/observability-mcp-tests:local
+
+    profiles:
+      - integration
+
+    user: "10001:10001"
+    stdin_open: true
+    read_only: true
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=64m
+
+    volumes:
+      - type: bind
+        source: ./tests/integration
+        target: /app/tests/integration
+        read_only: true
+
+      - type: bind
+        source: ${HOME}/.config/ai-incident-commander/keycloak/pki/dev-ca.crt
+        target: /run/ca/dev-ca.crt
+        read_only: true
+
+    environment:
+      AIC_TEST_MCP_URL: https://observability-mcp:8000/mcp
+      AIC_TEST_MCP_CA_FILE: /run/ca/dev-ca.crt
+      AIC_TEST_OAUTH_ISSUER_URL: https://auth.aic.test:8443/realms/incidents
+
+    networks:
+      - mcp_internal
+      - identity_ingress
+
 networks:
   mcp_internal:
     external: true
@@ -48,3 +87,7 @@ networks:
   otlp_ingress:
     external: true
     name: ai-incident-commander_otlp_ingress
+
+  identity_ingress:
+    external: true
+    name: ai-incident-commander_identity_ingress

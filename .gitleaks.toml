@@ -1,0 +1,16 @@
+title = "AI Incident Commander Secret Scanning Policy"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Non-secret internal Keycloak PostgreSQL JDBC URL"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = [
+    '''^(/scan/)?compose\.identity\.yaml$''',
+]
+regexes = [
+    '''^\n?[ \t]*KC_DB_URL:[ \t]*jdbc:postgresql://keycloak-db[:]5432/keycloak[ \t]*\r?$''',
+]

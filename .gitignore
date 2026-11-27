@@ -29,6 +29,19 @@ coverage.xml
 .env.*
 !.env.example
 
+# Local credentials and TLS material
+*.secret
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.csr
+
+# Local runtime configuration
+runtime.json
+
 # IDE-specific local files
 .idea/
 

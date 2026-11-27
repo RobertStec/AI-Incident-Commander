@@ -13,9 +13,14 @@
 # Defense in depth: never include secrets or local artifacts.
 **/.env
 **/.env.*
+**/*.secret
 **/*.pem
 **/*.key
 **/*.p12
 **/*.pfx
+**/*.crt
+**/*.cer
+**/*.csr
+**/runtime.json
 **/__pycache__/
 **/*.pyc
